@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import fs from "fs";
 
 dotenv.config();
 
@@ -9,7 +10,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = Number(process.env.PORT || 10000);
+const PORT =
+  Number(process.env.PORT || 10000);
 
 const TWELVE_DATA_API_KEY =
   process.env.TWELVE_DATA_API_KEY || "";
@@ -27,7 +29,7 @@ const SCAN_SECONDS =
   );
 
 const MIN_CONFIDENCE =
-  Number(process.env.MIN_CONFIDENCE || 78);
+  Number(process.env.MIN_CONFIDENCE || 68);
 
 const MAX_OPEN_TRADES = 2;
 
@@ -40,16 +42,22 @@ const ASSETS = {
 
   XAUUSD: {
     api: "XAU/USD",
-    label: "GOLD"
+    label: "GOLD",
+    digits: 2
   },
 
   BTCUSD: {
     api: "BTC/USD",
-    label: "BITCOIN"
+    label: "BITCOIN",
+    digits: 2
   }
 
 };
 
+
+/* =========================
+   TIMEFRAMES
+========================= */
 
 const TIMEFRAMES = {
 
@@ -61,50 +69,66 @@ const TIMEFRAMES = {
 
 
 /* =========================
-   STATE
+   MEMORY
 ========================= */
 
-const state = {
+const signals = new Map();
 
-  updatedAt: null,
+const openTrades = new Map();
 
-  running: false,
+const lastSignalTimes = new Map();
 
-  error: null,
+let history = [];
 
-  assets: {
+let scanning = false;
 
-    XAUUSD: {
-      M5: null,
-      M15: null
-    },
+let lastScanAt = null;
 
-    BTCUSD: {
-      M5: null,
-      M15: null
-    }
-
-  }
-
-};
-
-
-const candleCache = new Map();
-
-const acceptedSignalFingerprints =
-  new Map();
-
-let apiRequestTimes = [];
-
-let apiGate =
-  Promise.resolve();
-
-let tradeHistory = [];
+const HISTORY_FILE =
+  "./history.json";
 
 
 /* =========================
    HELPERS
 ========================= */
+
+function nowIso() {
+
+  return new Date().toISOString();
+}
+
+
+function round(
+  value,
+  digits = 2
+) {
+
+  if (
+    value === null ||
+    value === undefined ||
+    !Number.isFinite(Number(value))
+  ) {
+
+    return null;
+  }
+
+  return Number(
+    Number(value).toFixed(digits)
+  );
+}
+
+
+function formatPrice(
+  asset,
+  value
+) {
+
+  return round(
+    value,
+    ASSETS[asset]?.digits || 2
+  );
+}
+
 
 function sleep(ms) {
 
@@ -112,254 +136,166 @@ function sleep(ms) {
     resolve =>
       setTimeout(resolve, ms)
   );
-
-}
-
-
-function nowIso() {
-
-  return new Date()
-    .toISOString();
-
-}
-
-
-function isOpenStatus(status) {
-
-  return [
-    "OPEN",
-    "TP1",
-    "TP2"
-  ].includes(
-    String(status || "")
-      .toUpperCase()
-  );
-
-}
-
-
-function getOpenTrades() {
-
-  return tradeHistory.filter(
-    t =>
-      isOpenStatus(t.status)
-  );
-
-}
-
-
-function getOpenTradeForAsset(
-  symbol
-) {
-
-  return (
-    tradeHistory.find(
-      t =>
-        t.symbol === symbol &&
-        isOpenStatus(t.status)
-    ) || null
-  );
-
-}
-
-
-function roundPrice(value) {
-
-  if(
-    !Number.isFinite(
-      Number(value)
-    )
-  ) {
-
-    return null;
-
-  }
-
-  return Number(
-    Number(value)
-      .toFixed(2)
-  );
-
-}
-
-
-function priceText(value) {
-
-  if(
-    !Number.isFinite(
-      Number(value)
-    )
-  ) {
-
-    return "—";
-
-  }
-
-  return Number(value)
-    .toFixed(2);
-
 }
 
 
 /* =========================
-   API CREDIT GUARD
-   MAX 8 / MINUTE
+   HISTORY
 ========================= */
 
-async function reserveApiCredit() {
+function loadHistory() {
 
-  const run =
-    apiGate.then(
-      async () => {
+  try {
 
-        while(true) {
+    if (
+      fs.existsSync(HISTORY_FILE)
+    ) {
 
-          const now =
-            Date.now();
+      const raw =
+        fs.readFileSync(
+          HISTORY_FILE,
+          "utf8"
+        );
 
-          apiRequestTimes =
-            apiRequestTimes.filter(
-              t =>
-                now - t < 60000
-            );
+      history =
+        JSON.parse(raw);
 
-          if(
-            apiRequestTimes.length < 8
-          ) {
+      if (
+        !Array.isArray(history)
+      ) {
 
-            apiRequestTimes.push(
-              Date.now()
-            );
-
-            return;
-
-          }
-
-          const wait =
-            Math.max(
-              500,
-              60000 -
-              (
-                now -
-                apiRequestTimes[0]
-              )
-              +
-              400
-            );
-
-          await sleep(wait);
-
-        }
-
+        history = [];
       }
+    }
+
+  } catch (error) {
+
+    console.log(
+      "History load error:",
+      error.message
     );
 
+    history = [];
+  }
+}
 
-  apiGate =
-    run.catch(
-      () => {}
+
+function saveHistory() {
+
+  try {
+
+    fs.writeFileSync(
+      HISTORY_FILE,
+      JSON.stringify(
+        history.slice(0, 500),
+        null,
+        2
+      ),
+      "utf8"
     );
 
-  return run;
+  } catch (error) {
 
+    console.log(
+      "History save error:",
+      error.message
+    );
+  }
 }
 
 
 /* =========================
-   INDICATORS
+   EMA
 ========================= */
 
-function emaSeries(
+function ema(
   values,
   period
 ) {
 
-  if(
-    !values.length
+  if (
+    !values ||
+    values.length < period
   ) {
 
-    return [];
-
+    return null;
   }
 
   const k =
-    2 /
-    (
-      period + 1
-    );
+    2 / (period + 1);
 
-  const out =
-    [values[0]];
+  let result =
+    values
+      .slice(0, period)
+      .reduce(
+        (a, b) => a + b,
+        0
+      ) / period;
 
-  for(
-    let i = 1;
+  for (
+    let i = period;
     i < values.length;
     i++
   ) {
 
-    out.push(
-
-      values[i] * k
-      +
-      out[i - 1] *
-      (1 - k)
-
-    );
-
+    result =
+      values[i] * k +
+      result * (1 - k);
   }
 
-  return out;
-
+  return result;
 }
 
+
+/* =========================
+   RSI 14
+========================= */
 
 function rsi(
   values,
   period = 14
 ) {
 
-  if(
-    !Array.isArray(values)
-    ||
-    values.length <= period
+  if (
+    !values ||
+    values.length <
+      period + 1
   ) {
 
-    return 50;
-
+    return null;
   }
+
+  const recent =
+    values.slice(
+      -(period + 1)
+    );
 
   let gains = 0;
 
   let losses = 0;
 
-  for(
-    let i =
-      values.length - period;
-    i < values.length;
+  for (
+    let i = 1;
+    i < recent.length;
     i++
   ) {
 
-    const change =
-      values[i] -
-      values[i - 1];
+    const diff =
+      recent[i] -
+      recent[i - 1];
 
-    if(
-      change >= 0
+    if (
+      diff > 0
     ) {
 
-      gains +=
-        change;
+      gains += diff;
 
-    }
-    else {
+    } else {
 
       losses +=
-        Math.abs(change);
-
+        Math.abs(diff);
     }
-
   }
-
 
   const avgGain =
     gains / period;
@@ -367,54 +303,46 @@ function rsi(
   const avgLoss =
     losses / period;
 
-
-  if(
+  if (
     avgLoss === 0
   ) {
 
     return 100;
-
   }
-
 
   const rs =
     avgGain /
     avgLoss;
 
-
   return (
     100 -
-    100 /
-    (
-      1 + rs
-    )
+    100 / (1 + rs)
   );
-
 }
 
+
+/* =========================
+   ATR 14
+========================= */
 
 function atr(
   candles,
   period = 14
 ) {
 
-  if(
-    !Array.isArray(candles)
-    ||
-    candles.length <= period
+  if (
+    !candles ||
+    candles.length <
+      period + 1
   ) {
 
-    return 0;
-
+    return null;
   }
 
+  const values = [];
 
-  const trs = [];
-
-
-  for(
-    let i =
-      candles.length - period;
+  for (
+    let i = 1;
     i < candles.length;
     i++
   ) {
@@ -425,9 +353,7 @@ function atr(
     const previous =
       candles[i - 1];
 
-
-    trs.push(
-
+    const tr =
       Math.max(
 
         current.high -
@@ -442,129 +368,65 @@ function atr(
           current.low -
           previous.close
         )
+      );
 
-      )
-
-    );
-
+    values.push(tr);
   }
 
+  const recent =
+    values.slice(-period);
 
   return (
-    trs.reduce(
-      (a, b) =>
-        a + b,
+    recent.reduce(
+      (a, b) => a + b,
       0
-    )
-    /
-    trs.length
+    ) /
+    recent.length
   );
-
 }
 
 
-function slope(
+/* =========================
+   MOMENTUM %
+========================= */
+
+function momentumPercent(
   values,
-  lookback = 5
+  period = 3
 ) {
 
-  if(
-    !Array.isArray(values)
-    ||
-    values.length <
-    lookback + 1
+  if (
+    !values ||
+    values.length <= period
   ) {
 
     return 0;
-
   }
 
+  const current =
+    values[
+      values.length - 1
+    ];
 
-  const a =
-    values.at(-1);
-
-  const b =
+  const previous =
     values[
       values.length -
       1 -
-      lookback
+      period
     ];
 
+  if (!previous) {
+    return 0;
+  }
 
   return (
     (
-      a - b
-    )
-    /
-    Math.max(
-      Math.abs(b),
-      1
-    )
-    *
+      current -
+      previous
+    ) /
+    previous *
     100
   );
-
-}
-
-
-function macd(values) {
-
-  if(
-    values.length < 35
-  ) {
-
-    return {
-      line: 0,
-      signal: 0,
-      hist: 0
-    };
-
-  }
-
-
-  const e12 =
-    emaSeries(
-      values,
-      12
-    );
-
-  const e26 =
-    emaSeries(
-      values,
-      26
-    );
-
-
-  const lineSeries =
-    values.map(
-      (_, i) =>
-        e12[i] -
-        e26[i]
-    );
-
-
-  const signalSeries =
-    emaSeries(
-      lineSeries,
-      9
-    );
-
-
-  return {
-
-    line:
-      lineSeries.at(-1),
-
-    signal:
-      signalSeries.at(-1),
-
-    hist:
-      lineSeries.at(-1)
-      -
-      signalSeries.at(-1)
-
-  };
-
 }
 
 
@@ -572,894 +434,505 @@ function macd(values) {
    TWELVE DATA
 ========================= */
 
-async function fetchCandles(
-  apiSymbol,
-  interval,
-  outputsize = 80,
-  force = false
+async function getCandles(
+  asset,
+  timeframe
 ) {
 
-  if(
-    !TWELVE_DATA_API_KEY
-  ) {
+  const symbol =
+    ASSETS[asset].api;
 
-    throw new Error(
-      "TWELVE_DATA_API_KEY is missing"
-    );
-
-  }
-
-
-  const cacheKey =
-    `${apiSymbol}|${interval}`;
-
-
-  const cached =
-    candleCache.get(
-      cacheKey
-    );
-
-
-  if(
-    !force
-    &&
-    cached
-    &&
-    Date.now() -
-    cached.time <
-    45000
-  ) {
-
-    return (
-      cached.candles
-        .slice(
-          -outputsize
-        )
-    );
-
-  }
-
-
-  await reserveApiCredit();
-
+  const interval =
+    TIMEFRAMES[timeframe];
 
   const url =
-    new URL(
-      "https://api.twelvedata.com/time_series"
-    );
-
-
-  url.searchParams.set(
-    "symbol",
-    apiSymbol
-  );
-
-  url.searchParams.set(
-    "interval",
-    interval
-  );
-
-  url.searchParams.set(
-    "outputsize",
-    String(
-      Math.max(
-        80,
-        outputsize
-      )
-    )
-  );
-
-  url.searchParams.set(
-    "apikey",
-    TWELVE_DATA_API_KEY
-  );
-
+    "https://api.twelvedata.com/time_series" +
+    `?symbol=${encodeURIComponent(symbol)}` +
+    `&interval=${encodeURIComponent(interval)}` +
+    "&outputsize=80" +
+    `&apikey=${encodeURIComponent(TWELVE_DATA_API_KEY)}`;
 
   const response =
-    await fetch(
-      url,
-      {
-        headers: {
-          Accept:
-            "application/json"
-        }
-      }
-    );
-
+    await fetch(url);
 
   const data =
-    await response
-      .json()
-      .catch(
-        () => ({})
-      );
+    await response.json();
 
-
-  if(
-    !response.ok
-    ||
-    data.status === "error"
-    ||
-    !Array.isArray(
-      data.values
-    )
+  if (
+    !response.ok ||
+    data.status === "error" ||
+    !Array.isArray(data.values)
   ) {
 
     throw new Error(
-
-      data.message
-      ||
-      data.code
-      ||
-      `Twelve Data HTTP ${response.status}`
-
+      data.message ||
+      `Twelve Data error ${response.status}`
     );
-
   }
 
+  return data.values
+    .map(item => ({
 
-  const candles =
-    data.values
+      datetime:
+        item.datetime,
 
-      .map(
-        v => ({
+      open:
+        Number(item.open),
 
-          datetime:
-            v.datetime,
+      high:
+        Number(item.high),
 
-          open:
-            Number(v.open),
+      low:
+        Number(item.low),
 
-          high:
-            Number(v.high),
+      close:
+        Number(item.close)
 
-          low:
-            Number(v.low),
-
-          close:
-            Number(v.close)
-
-        })
-      )
-
-      .filter(
-        c =>
-          [
-            c.open,
-            c.high,
-            c.low,
-            c.close
-          ]
-          .every(
-            Number.isFinite
-          )
-      )
-
-      .reverse();
-
-
-  candleCache.set(
-    cacheKey,
-    {
-      time:
-        Date.now(),
-
-      candles
-    }
-  );
-
-
-  return (
-    candles.slice(
-      -outputsize
+    }))
+    .filter(
+      candle =>
+        Number.isFinite(
+          candle.close
+        )
     )
-  );
-
+    .reverse();
 }
 
 
 /* =========================
-   FAST SIGNAL ENGINE
+   TF ANALYSIS
 ========================= */
 
-function analyze(
-  symbol,
+function analyseTimeframe(
+  asset,
   timeframe,
   candles
 ) {
 
-  if(
-    !Array.isArray(candles)
-    ||
-    candles.length < 50
+  if (
+    !candles ||
+    candles.length < 30
   ) {
 
-    throw new Error(
-      "Not enough candles"
-    );
+    return {
 
+      asset,
+
+      timeframe,
+
+      status: "WAIT",
+
+      score: 0,
+
+      confidence: 0,
+
+      reason:
+        "WARMING_UP"
+
+    };
   }
-
 
   const closes =
     candles.map(
-      c =>
-        c.close
+      x => x.close
     );
 
-
-  const latest =
-    candles.at(-1);
+  const last =
+    candles[
+      candles.length - 1
+    ];
 
   const previous =
-    candles.at(-2);
+    candles[
+      candles.length - 2
+    ];
 
-
-  const e9 =
-    emaSeries(
+  const ema9 =
+    ema(
       closes,
       9
     );
 
-  const e21 =
-    emaSeries(
+  const ema21 =
+    ema(
       closes,
       21
     );
 
-  const e50 =
-    emaSeries(
-      closes,
-      50
-    );
-
-
-  const fast =
-    e9.at(-1);
-
-  const slow =
-    e21.at(-1);
-
-  const long =
-    e50.at(-1);
-
-
-  const rsi14 =
+  const currentRsi =
     rsi(
       closes,
       14
     );
 
-
-  const atr14 =
+  const currentAtr =
     atr(
       candles,
       14
     );
 
-
   const momentum =
-    slope(
+    momentumPercent(
       closes,
-      6
+      3
     );
 
-
-  const trendSlope =
-    slope(
-      e21,
-      5
-    );
+  let score = 0;
 
 
-  const M =
-    macd(
-      closes
-    );
+  // EMA TREND
 
-
-  const body =
-    Math.abs(
-      latest.close -
-      latest.open
-    );
-
-
-  const range =
-    Math.max(
-      latest.high -
-      latest.low,
-      1e-9
-    );
-
-
-  const bodyRatio =
-    body /
-    range;
-
-
-  const atrPct =
-    atr14
-    /
-    Math.max(
-      latest.close,
-      1
-    )
-    *
-    100;
-
-
-  let buy = 0;
-
-  let sell = 0;
-
-
-  if(
-    fast > slow
+  if (
+    ema9 > ema21
   ) {
 
-    buy += 18;
-
-  }
-  else {
-
-    sell += 18;
-
+    score += 3;
   }
 
-
-  if(
-    slow > long
+  if (
+    ema9 < ema21
   ) {
 
-    buy += 15;
-
-  }
-  else {
-
-    sell += 15;
-
+    score -= 3;
   }
 
 
-  if(
-    latest.close > fast
+  // PRICE VS EMA
+
+  if (
+    last.close > ema9
   ) {
 
-    buy += 9;
-
-  }
-  else {
-
-    sell += 9;
-
+    score += 1;
   }
 
-
-  if(
-    latest.close > slow
+  if (
+    last.close < ema9
   ) {
 
-    buy += 7;
-
-  }
-  else {
-
-    sell += 7;
-
+    score -= 1;
   }
 
 
-  if(
-    trendSlope > 0.010
+  // RSI
+
+  if (
+    currentRsi >= 52 &&
+    currentRsi <= 72
   ) {
 
-    buy += 10;
-
+    score += 2;
   }
-  else if(
-    trendSlope < -0.010
+
+  if (
+    currentRsi <= 48 &&
+    currentRsi >= 28
   ) {
 
-    sell += 10;
-
+    score -= 2;
   }
 
 
-  if(
-    rsi14 >= 52
-    &&
-    rsi14 <= 70
+  // MOMENTUM
+
+  if (
+    momentum > 0.02
   ) {
 
-    buy += 13;
-
+    score += 2;
   }
-  else if(
-    rsi14 <= 48
-    &&
-    rsi14 >= 30
+
+  if (
+    momentum < -0.02
   ) {
 
-    sell += 13;
-
+    score -= 2;
   }
-  else if(
-    rsi14 > 72
+
+
+  // LAST CANDLE
+
+  if (
+    last.close > last.open
   ) {
 
-    sell += 3;
-
+    score += 1;
   }
-  else if(
-    rsi14 < 28
+
+  if (
+    last.close < last.open
   ) {
 
-    buy += 3;
-
+    score -= 1;
   }
 
 
-  if(
-    momentum > 0.015
+  // CANDLE FOLLOW THROUGH
+
+  if (
+    last.close >
+    previous.close
   ) {
 
-    buy += 10;
-
+    score += 1;
   }
-  else if(
-    momentum < -0.015
+
+  if (
+    last.close <
+    previous.close
   ) {
 
-    sell += 10;
-
+    score -= 1;
   }
 
 
-  if(
-    M.hist > 0
-    &&
-    M.line > M.signal
-  ) {
-
-    buy += 10;
-
-  }
-  else if(
-    M.hist < 0
-    &&
-    M.line < M.signal
-  ) {
-
-    sell += 10;
-
-  }
-
-
-  if(
-    latest.close >
-    latest.open
-  ) {
-
-    buy += 4;
-
-  }
-
-
-  if(
-    latest.close <
-    latest.open
-  ) {
-
-    sell += 4;
-
-  }
-
-
-  if(
-    latest.close >
-    latest.open
-    &&
-    previous.close >
-    previous.open
-  ) {
-
-    buy += 4;
-
-  }
-
-
-  if(
-    latest.close <
-    latest.open
-    &&
-    previous.close <
-    previous.open
-  ) {
-
-    sell += 4;
-
-  }
-
-
-  if(
-    bodyRatio > 0.50
-  ) {
-
-    if(
-      latest.close >
-      latest.open
-    ) {
-
-      buy += 5;
-
-    }
-    else {
-
-      sell += 5;
-
-    }
-
-  }
-
-
-  const dominant =
-    Math.max(
-      buy,
-      sell
-    );
-
-
-  const difference =
-    Math.abs(
-      buy -
-      sell
-    );
-
-
-  const buyTrend =
-
-    fast > slow
-    &&
-    latest.close > slow
-    &&
-    trendSlope >= 0;
-
-
-  const sellTrend =
-
-    fast < slow
-    &&
-    latest.close < slow
-    &&
-    trendSlope <= 0;
-
-
-  const volatilityOK =
-
-    atrPct >= (
-      symbol === "BTCUSD"
-        ? 0.06
-        : 0.018
-    );
-
-
-  let side =
+  let status =
     "WAIT";
 
-
-  if(
-    volatilityOK
-    &&
-    buy >= 60
-    &&
-    difference >= 10
-    &&
-    buyTrend
-    &&
-    rsi14 < 74
-    &&
-    momentum > -0.015
+  if (
+    score >= 4
   ) {
 
-    side =
-      "BUY";
-
+    status = "BUY";
   }
 
-
-  if(
-    volatilityOK
-    &&
-    sell >= 60
-    &&
-    difference >= 10
-    &&
-    sellTrend
-    &&
-    rsi14 > 26
-    &&
-    momentum < 0.015
+  if (
+    score <= -4
   ) {
 
-    side =
-      "SELL";
-
+    status = "SELL";
   }
 
 
   const confidence =
+    status === "WAIT"
 
-    side === "WAIT"
-
-      ?
-
-      Math.round(
-
-        Math.min(
-          72,
-          45 +
-          dominant * 0.25
+      ? Math.min(
+          67,
+          48 +
+          Math.abs(score) * 3
         )
 
-      )
-
-      :
-
-      Math.round(
-
-        Math.max(
-          72,
-
-          Math.min(
-            96,
-
-            58
-            +
-            dominant * 0.34
-            +
-            difference * 0.10
-          )
-
-        )
-
-      );
-
-
-  const entry =
-    latest.close;
-
-
-  const atrFloor =
-
-    entry * (
-
-      symbol === "BTCUSD"
-
-        ? 0.0011
-
-        : 0.0008
-
-    );
-
-
-  const risk =
-    Math.max(
-      atr14 * 1.10,
-      atrFloor
-    );
-
-
-  let sl = null;
-
-  let tp1 = null;
-
-  let tp2 = null;
-
-  let tp3 = null;
-
-
-  if(
-    side === "BUY"
-  ) {
-
-    sl =
-      entry -
-      risk;
-
-    tp1 =
-      entry +
-      risk * 0.85;
-
-    tp2 =
-      entry +
-      risk * 1.45;
-
-    tp3 =
-      entry +
-      risk * 2.20;
-
-  }
-
-
-  if(
-    side === "SELL"
-  ) {
-
-    sl =
-      entry +
-      risk;
-
-    tp1 =
-      entry -
-      risk * 0.85;
-
-    tp2 =
-      entry -
-      risk * 1.45;
-
-    tp3 =
-      entry -
-      risk * 2.20;
-
-  }
-
-
-  const quality =
-
-    side === "WAIT"
-
-      ? "WAIT"
-
-      : confidence >= 90
-
-        ? "EXCELLENT"
-
-        : confidence >= 82
-
-          ? "STRONG"
-
-          : "VALID";
+      : Math.min(
+          96,
+          55 +
+          Math.abs(score) * 5
+        );
 
 
   return {
 
-    symbol,
-
-    asset:
-      symbol,
+    asset,
 
     timeframe,
 
-    side,
+    status,
 
-    signal:
-      side,
-
-    direction:
-      side,
+    score,
 
     confidence,
 
-    quality,
-
     price:
-      roundPrice(
-        entry
+      formatPrice(
+        asset,
+        last.close
       ),
 
-    currentPrice:
-      roundPrice(
-        entry
+    ema9:
+      formatPrice(
+        asset,
+        ema9
       ),
 
-    entry:
-      side === "WAIT"
-        ? null
-        : roundPrice(
-            entry
-          ),
-
-    sl:
-      roundPrice(
-        sl
-      ),
-
-    stopLoss:
-      roundPrice(
-        sl
-      ),
-
-    tp1:
-      roundPrice(
-        tp1
-      ),
-
-    tp2:
-      roundPrice(
-        tp2
-      ),
-
-    tp3:
-      roundPrice(
-        tp3
-      ),
-
-    levels: {
-
-      entry:
-        side === "WAIT"
-          ? null
-          : roundPrice(
-              entry
-            ),
-
-      sl:
-        roundPrice(
-          sl
-        ),
-
-      stopLoss:
-        roundPrice(
-          sl
-        ),
-
-      tp1:
-        roundPrice(
-          tp1
-        ),
-
-      tp2:
-        roundPrice(
-          tp2
-        ),
-
-      tp3:
-        roundPrice(
-          tp3
-        )
-
-    },
-
-    rsi14:
-      Number(
-        rsi14.toFixed(1)
+    ema21:
+      formatPrice(
+        asset,
+        ema21
       ),
 
     rsi:
-      Number(
-        rsi14.toFixed(1)
+      round(
+        currentRsi,
+        1
       ),
 
-    atr14:
-      roundPrice(
-        atr14
+    atr:
+      formatPrice(
+        asset,
+        currentAtr
       ),
 
     momentum:
-      Number(
-        momentum.toFixed(3)
+      round(
+        momentum,
+        4
       ),
 
-    buyScore:
-      buy,
-
-    sellScore:
-      sell,
-
     candleTime:
-      latest.datetime,
+      last.datetime,
 
-    candles:
-      candles.slice(-80)
-
+    updatedAt:
+      nowIso()
   };
-
 }
 
 
 /* =========================
-   ONESIGNAL
+   FINAL M5 + M15 SIGNAL
+========================= */
+
+function combineSignals(
+  asset,
+  m5,
+  m15
+) {
+
+  let direction =
+    "WAIT";
+
+  let confidence = 0;
+
+  let reason =
+    "Waiting for confirmation";
+
+
+  // Strong agreement
+
+  if (
+    m5.status === "BUY" &&
+    m15.status === "BUY"
+  ) {
+
+    direction = "BUY";
+
+    confidence =
+      Math.round(
+        m5.confidence * 0.6 +
+        m15.confidence * 0.4
+      );
+
+    reason =
+      "M5 + M15 bullish confirmation";
+  }
+
+
+  if (
+    m5.status === "SELL" &&
+    m15.status === "SELL"
+  ) {
+
+    direction = "SELL";
+
+    confidence =
+      Math.round(
+        m5.confidence * 0.6 +
+        m15.confidence * 0.4
+      );
+
+    reason =
+      "M5 + M15 bearish confirmation";
+  }
+
+
+  /*
+    FAST MODE
+
+    M5 may trigger when M15 is WAIT,
+    provided M15 is not strongly opposite.
+  */
+
+  if (
+    direction === "WAIT" &&
+    m5.status === "BUY" &&
+    m5.confidence >= 70 &&
+    m15.score >= -1
+  ) {
+
+    direction = "BUY";
+
+    confidence =
+      Math.round(
+        m5.confidence * 0.75 +
+        Math.max(
+          55,
+          m15.confidence
+        ) * 0.25
+      );
+
+    reason =
+      "FAST M5 bullish + M15 not bearish";
+  }
+
+
+  if (
+    direction === "WAIT" &&
+    m5.status === "SELL" &&
+    m5.confidence >= 70 &&
+    m15.score <= 1
+  ) {
+
+    direction = "SELL";
+
+    confidence =
+      Math.round(
+        m5.confidence * 0.75 +
+        Math.max(
+          55,
+          m15.confidence
+        ) * 0.25
+      );
+
+    reason =
+      "FAST M5 bearish + M15 not bullish";
+  }
+
+
+  if (
+    confidence <
+    MIN_CONFIDENCE
+  ) {
+
+    direction =
+      "WAIT";
+
+    reason =
+      "Confidence below minimum";
+  }
+
+
+  return {
+
+    asset,
+
+    label:
+      ASSETS[asset].label,
+
+    symbol:
+      ASSETS[asset].api,
+
+    direction,
+
+    confidence,
+
+    reason,
+
+    price:
+      m5.price,
+
+    M5:
+      m5,
+
+    M15:
+      m15,
+
+    updatedAt:
+      nowIso()
+  };
+}
+
+
+/* =========================
+   ONE SIGNAL
 ========================= */
 
 async function sendPush(
@@ -1468,33 +941,27 @@ async function sendPush(
   data = {}
 ) {
 
-  if(
-    !ONESIGNAL_APP_ID
-    ||
+  if (
+    !ONESIGNAL_APP_ID ||
     !ONESIGNAL_API_KEY
   ) {
 
     console.log(
-      "OneSignal skipped - keys missing"
+      "OneSignal not configured"
     );
 
-    return {
-      skipped: true
-    };
-
+    return false;
   }
-
 
   try {
 
     const response =
       await fetch(
-
         "https://api.onesignal.com/notifications",
-
         {
 
-          method: "POST",
+          method:
+            "POST",
 
           headers: {
 
@@ -1512,22 +979,16 @@ async function sendPush(
               app_id:
                 ONESIGNAL_APP_ID,
 
-              target_channel:
-                "push",
-
-              included_segments:
-                [
-                  "Subscribed Users"
-                ],
+              included_segments: [
+                "Subscribed Users"
+              ],
 
               headings: {
-                en:
-                  title
+                en: title
               },
 
               contents: {
-                en:
-                  message
+                en: message
               },
 
               data
@@ -1535,359 +996,254 @@ async function sendPush(
             })
 
         }
-
       );
 
-
-    const body =
+    const result =
       await response
         .json()
-        .catch(
-          () => ({})
-        );
+        .catch(() => ({}));
 
-
-    if(
+    if (
       !response.ok
     ) {
 
-      console.error(
+      console.log(
         "OneSignal error:",
-        body
+        result
       );
 
-
-      return {
-
-        ok:
-          false,
-
-        status:
-          response.status,
-
-        body
-
-      };
-
+      return false;
     }
 
-
     console.log(
-      "OneSignal sent:",
+      "PUSH SENT:",
       title
     );
 
+    return true;
 
-    return {
+  } catch (error) {
 
-      ok:
-        true,
-
-      body
-
-    };
-
-  }
-  catch(error) {
-
-    console.error(
-      "OneSignal request failed:",
+    console.log(
+      "Push error:",
       error.message
     );
 
-
-    return {
-
-      ok:
-        false,
-
-      error:
-        error.message
-
-    };
-
+    return false;
   }
-
 }
 
 
 /* =========================
-   TRADE TRACKER
+   TRADE LEVELS
 ========================= */
 
-function chooseConfirmedCandidate(
-  symbol
-) {
-
-  const asset =
-    state.assets[
-      symbol
-    ];
-
-
-  const m5 =
-    asset?.M5;
-
-  const m15 =
-    asset?.M15;
-
-
-  const m5Valid =
-
-    [
-      "BUY",
-      "SELL"
-    ].includes(
-      m5?.side
-    )
-
-    &&
-
-    Number(
-      m5?.confidence || 0
-    )
-    >=
-    MIN_CONFIDENCE;
-
-
-  const m15Valid =
-
-    [
-      "BUY",
-      "SELL"
-    ].includes(
-      m15?.side
-    )
-
-    &&
-
-    Number(
-      m15?.confidence || 0
-    )
-    >=
-    MIN_CONFIDENCE;
-
-
-  if(
-    m5Valid
-    &&
-    m15Valid
-    &&
-    m5.side !== m15.side
-  ) {
-
-    return null;
-
-  }
-
-
-  if(
-    m5Valid
-    &&
-    m15Valid
-  ) {
-
-    const best =
-
-      Number(
-        m15.confidence
-      )
-
-      >
-
-      Number(
-        m5.confidence
-      )
-
-        ?
-
-        m15
-
-        :
-
-        m5;
-
-
-    return {
-
-      ...best,
-
-      mtfConfirmed:
-        true
-
-    };
-
-  }
-
-
-  if(
-    m15Valid
-  ) {
-
-    return {
-
-      ...m15,
-
-      mtfConfirmed:
-        false
-
-    };
-
-  }
-
-
-  if(
-    m5Valid
-  ) {
-
-    return {
-
-      ...m5,
-
-      mtfConfirmed:
-        false
-
-    };
-
-  }
-
-
-  return null;
-
-}
-
-
-function signalFingerprint(
+function createTradeLevels(
+  asset,
   signal
 ) {
 
-  return [
+  const entry =
+    Number(
+      signal.price
+    );
 
-    signal.symbol,
+  const atrValue =
+    Number(
+      signal.M5.atr
+    );
 
-    signal.timeframe,
-
-    signal.side,
-
-    signal.candleTime
-
-  ].join("|");
-
-}
-
-
-async function createTradeFromSignal(
-  signal
-) {
-
-  if(
-    !signal
+  if (
+    !Number.isFinite(entry) ||
+    !Number.isFinite(atrValue) ||
+    atrValue <= 0
   ) {
 
     return null;
+  }
 
+  let sl;
+
+  let tp1;
+
+  let tp2;
+
+  let tp3;
+
+
+  if (
+    signal.direction ===
+    "BUY"
+  ) {
+
+    sl =
+      entry -
+      atrValue * 1.15;
+
+    tp1 =
+      entry +
+      atrValue * 1.0;
+
+    tp2 =
+      entry +
+      atrValue * 1.8;
+
+    tp3 =
+      entry +
+      atrValue * 2.6;
+
+  } else {
+
+    sl =
+      entry +
+      atrValue * 1.15;
+
+    tp1 =
+      entry -
+      atrValue * 1.0;
+
+    tp2 =
+      entry -
+      atrValue * 1.8;
+
+    tp3 =
+      entry -
+      atrValue * 2.6;
   }
 
 
-  if(
-    getOpenTrades()
-      .length
-    >=
+  return {
+
+    entry:
+      formatPrice(
+        asset,
+        entry
+      ),
+
+    sl:
+      formatPrice(
+        asset,
+        sl
+      ),
+
+    tp1:
+      formatPrice(
+        asset,
+        tp1
+      ),
+
+    tp2:
+      formatPrice(
+        asset,
+        tp2
+      ),
+
+    tp3:
+      formatPrice(
+        asset,
+        tp3
+      )
+  };
+}
+
+
+/* =========================
+   OPEN TRADE
+========================= */
+
+async function maybeOpenTrade(
+  asset,
+  signal
+) {
+
+  if (
+    signal.direction ===
+    "WAIT"
+  ) {
+
+    return;
+  }
+
+
+  if (
+    openTrades.has(asset)
+  ) {
+
+    return;
+  }
+
+
+  if (
+    openTrades.size >=
     MAX_OPEN_TRADES
   ) {
 
-    return null;
-
+    return;
   }
 
 
-  if(
-    getOpenTradeForAsset(
-      signal.symbol
-    )
+  const lastSignal =
+    lastSignalTimes.get(asset) || 0;
+
+
+  // Prevent duplicate signals for 15 minutes
+
+  if (
+    Date.now() -
+    lastSignal <
+    15 * 60 * 1000
   ) {
 
-    return null;
-
+    return;
   }
 
 
-  const fingerprint =
-    signalFingerprint(
+  const levels =
+    createTradeLevels(
+      asset,
       signal
     );
 
 
-  const lastFingerprint =
-    acceptedSignalFingerprints.get(
-      signal.symbol
-    );
+  if (!levels) {
 
-
-  if(
-    lastFingerprint ===
-    fingerprint
-  ) {
-
-    return null;
-
+    return;
   }
-
-
-  acceptedSignalFingerprints.set(
-    signal.symbol,
-    fingerprint
-  );
 
 
   const trade = {
 
     id:
-      `${Date.now()}-${signal.symbol}`,
+      `${asset}-${Date.now()}`,
 
-    symbol:
-      signal.symbol,
+    asset,
 
-    asset:
-      signal.symbol,
+    label:
+      ASSETS[asset].label,
 
     direction:
-      signal.side,
-
-    side:
-      signal.side,
-
-    timeframe:
-      signal.timeframe,
-
-    mtfConfirmed:
-      Boolean(
-        signal.mtfConfirmed
-      ),
+      signal.direction,
 
     confidence:
       signal.confidence,
 
     entry:
-      signal.entry,
-
-    originalSl:
-      signal.sl,
+      levels.entry,
 
     sl:
-      signal.sl,
+      levels.sl,
+
+    originalSl:
+      levels.sl,
 
     tp1:
-      signal.tp1,
+      levels.tp1,
 
     tp2:
-      signal.tp2,
+      levels.tp2,
 
     tp3:
-      signal.tp3,
-
-    status:
-      "OPEN",
+      levels.tp3,
 
     tp1Hit:
       false,
@@ -1898,10 +1254,13 @@ async function createTradeFromSignal(
     tp3Hit:
       false,
 
-    breakEvenActive:
+    breakEven:
       false,
 
-    createdAt:
+    status:
+      "OPEN",
+
+    openedAt:
       nowIso(),
 
     updatedAt:
@@ -1910,1465 +1269,803 @@ async function createTradeFromSignal(
   };
 
 
-  tradeHistory.unshift(
+  openTrades.set(
+    asset,
     trade
   );
 
 
-  tradeHistory =
-    tradeHistory.slice(
-      0,
-      300
-    );
-
-
-  const mtfText =
-
-    trade.mtfConfirmed
-
-      ?
-
-      " • M5+M15 confirmed"
-
-      :
-
-      "";
+  lastSignalTimes.set(
+    asset,
+    Date.now()
+  );
 
 
   await sendPush(
 
-    `BIT ADAMS • ${trade.direction} ${trade.symbol}`,
+    `${trade.label} ${trade.direction} ✅`,
 
-    `${trade.timeframe}${mtfText} • Confidence ${trade.confidence}% • Entry ${priceText(trade.entry)} • SL ${priceText(trade.sl)} • TP1 ${priceText(trade.tp1)} • TP2 ${priceText(trade.tp2)} • TP3 ${priceText(trade.tp3)}`,
+    `Entry ${trade.entry} | SL ${trade.sl} | TP1 ${trade.tp1} | TP2 ${trade.tp2} | TP3 ${trade.tp3} | Confidence ${trade.confidence}%`,
 
     {
+      event:
+        "NEW_SIGNAL",
 
-      type:
-        "signal",
+      asset,
 
-      tradeId:
-        trade.id,
-
-      symbol:
-        trade.symbol,
-
-      timeframe:
-        trade.timeframe,
-
-      side:
-        trade.direction,
-
-      confidence:
-        trade.confidence,
-
-      entry:
-        trade.entry,
-
-      sl:
-        trade.sl,
-
-      tp1:
-        trade.tp1,
-
-      tp2:
-        trade.tp2,
-
-      tp3:
-        trade.tp3
-
+      trade
     }
-
   );
 
 
-  return trade;
-
+  console.log(
+    "NEW TRADE:",
+    trade
+  );
 }
 
 
-async function updateTrade(
+/* =========================
+   CLOSE TRADE
+========================= */
+
+async function closeTrade(
+  asset,
   trade,
+  result,
+  price
+) {
+
+  trade.status =
+    result;
+
+  trade.exit =
+    formatPrice(
+      asset,
+      price
+    );
+
+  trade.closedAt =
+    nowIso();
+
+  trade.updatedAt =
+    nowIso();
+
+
+  openTrades.delete(asset);
+
+
+  history.unshift({
+    ...trade
+  });
+
+
+  history =
+    history.slice(
+      0,
+      500
+    );
+
+
+  saveHistory();
+
+
+  await sendPush(
+
+    `${trade.label} ${result}`,
+
+    `${trade.direction} | Entry ${trade.entry} | Exit ${trade.exit}`,
+
+    {
+      event:
+        result,
+
+      asset,
+
+      trade
+    }
+  );
+}
+
+
+/* =========================
+   TRACK TP / SL
+========================= */
+
+async function trackTrade(
+  asset,
   currentPrice
 ) {
 
-  if(
-    !trade
-    ||
-    !isOpenStatus(
-      trade.status
-    )
-    ||
-    !Number.isFinite(
-      Number(currentPrice)
-    )
-  ) {
+  const trade =
+    openTrades.get(asset);
+
+
+  if (!trade) {
 
     return;
-
   }
 
 
   const price =
-    Number(
-      currentPrice
-    );
+    Number(currentPrice);
 
 
-  const isBuy =
-    trade.direction ===
-    "BUY";
-
-
-  const profitHit =
-    level =>
-      isBuy
-
-        ?
-
-        price >=
-        Number(level)
-
-        :
-
-        price <=
-        Number(level);
-
-
-  const stopHit =
-    level =>
-      isBuy
-
-        ?
-
-        price <=
-        Number(level)
-
-        :
-
-        price >=
-        Number(level);
-
-
-  if(
-    !trade.tp1Hit
-    &&
-    stopHit(
-      trade.originalSl
-    )
+  if (
+    !Number.isFinite(price)
   ) {
-
-    trade.status =
-      "LOST";
-
-    trade.closePrice =
-      roundPrice(
-        price
-      );
-
-    trade.closedAt =
-      nowIso();
-
-    trade.updatedAt =
-      nowIso();
-
-
-    await sendPush(
-
-      `BIT ADAMS • SL ${trade.symbol}`,
-
-      `${trade.direction} ${trade.timeframe} • LOST • Close ${priceText(price)}`,
-
-      {
-
-        type:
-          "lost",
-
-        tradeId:
-          trade.id,
-
-        symbol:
-          trade.symbol
-
-      }
-
-    );
-
 
     return;
-
   }
 
 
-  if(
-    !trade.tp1Hit
-    &&
-    profitHit(
-      trade.tp1
-    )
+  trade.updatedAt =
+    nowIso();
+
+
+  /* BUY */
+
+  if (
+    trade.direction === "BUY"
   ) {
 
-    trade.tp1Hit =
-      true;
+    if (
+      !trade.tp1Hit &&
+      price >= trade.tp1
+    ) {
 
-    trade.breakEvenActive =
-      true;
+      trade.tp1Hit = true;
 
-    trade.sl =
-      trade.entry;
+      trade.breakEven = true;
 
-    trade.status =
-      "TP1";
+      trade.sl =
+        trade.entry;
 
-    trade.tp1At =
-      nowIso();
+      trade.status =
+        "TP1";
 
-    trade.updatedAt =
-      nowIso();
+      await sendPush(
 
+        `${trade.label} TP1 ✅`,
 
-    await sendPush(
+        `TP1 hit ${trade.tp1}. Move SL to ENTRY ${trade.entry}.`,
 
-      `BIT ADAMS • TP1 ${trade.symbol}`,
+        {
+          event:
+            "TP1",
 
-      `TP1 hit ✅ • Move SL to ENTRY ${priceText(trade.entry)} • BREAK-EVEN protection ON`,
+          asset,
 
-      {
-
-        type:
-          "tp1",
-
-        tradeId:
-          trade.id,
-
-        symbol:
-          trade.symbol,
-
-        entry:
-          trade.entry
-
-      }
-
-    );
-
-  }
+          trade
+        }
+      );
+    }
 
 
-  if(
-    trade.tp1Hit
-    &&
-    !trade.tp2Hit
-    &&
-    profitHit(
-      trade.tp2
-    )
-  ) {
+    if (
+      !trade.tp2Hit &&
+      price >= trade.tp2
+    ) {
 
-    trade.tp2Hit =
-      true;
+      trade.tp2Hit = true;
 
-    trade.status =
-      "TP2";
+      trade.status =
+        "TP2";
 
-    trade.tp2At =
-      nowIso();
+      await sendPush(
 
-    trade.updatedAt =
-      nowIso();
+        `${trade.label} TP2 ✅`,
 
+        `TP2 hit ${trade.tp2}`,
 
-    await sendPush(
+        {
+          event:
+            "TP2",
 
-      `BIT ADAMS • TP2 ${trade.symbol}`,
+          asset,
 
-      `${trade.direction} ${trade.timeframe} • TP2 hit ✅`,
-
-      {
-
-        type:
-          "tp2",
-
-        tradeId:
-          trade.id,
-
-        symbol:
-          trade.symbol
-
-      }
-
-    );
-
-  }
+          trade
+        }
+      );
+    }
 
 
-  if(
-    trade.tp1Hit
-    &&
-    !trade.tp3Hit
-    &&
-    profitHit(
-      trade.tp3
-    )
-  ) {
+    if (
+      price >= trade.tp3
+    ) {
 
-    trade.tp3Hit =
-      true;
+      trade.tp3Hit = true;
 
-    trade.status =
-      "WIN";
+      await sendPush(
 
-    trade.closePrice =
-      roundPrice(
+        `${trade.label} TP3 ✅`,
+
+        `TP3 hit ${trade.tp3}`,
+
+        {
+          event:
+            "TP3",
+
+          asset,
+
+          trade
+        }
+      );
+
+
+      await closeTrade(
+        asset,
+        trade,
+        "WIN",
         price
       );
 
-    trade.tp3At =
-      nowIso();
-
-    trade.closedAt =
-      nowIso();
-
-    trade.updatedAt =
-      nowIso();
+      return;
+    }
 
 
-    await sendPush(
+    if (
+      price <= trade.sl
+    ) {
 
-      `BIT ADAMS • TP3 / WIN ${trade.symbol}`,
-
-      `${trade.direction} ${trade.timeframe} • TP3 hit 🏆 • WIN`,
-
-      {
-
-        type:
-          "win",
-
-        tradeId:
-          trade.id,
-
-        symbol:
-          trade.symbol
-
-      }
-
-    );
+      const result =
+        trade.breakEven
+          ? "BREAK-EVEN"
+          : "LOST";
 
 
-    return;
-
-  }
-
-
-  if(
-    trade.tp1Hit
-    &&
-    trade.breakEvenActive
-    &&
-    stopHit(
-      trade.entry
-    )
-  ) {
-
-    trade.status =
-      "BREAK-EVEN";
-
-    trade.closePrice =
-      roundPrice(
+      await closeTrade(
+        asset,
+        trade,
+        result,
         price
       );
 
-    trade.closedAt =
-      nowIso();
-
-    trade.updatedAt =
-      nowIso();
-
-
-    await sendPush(
-
-      `BIT ADAMS • BREAK-EVEN ${trade.symbol}`,
-
-      `${trade.direction} ${trade.timeframe} • Closed at ENTRY ${priceText(trade.entry)}`,
-
-      {
-
-        type:
-          "break_even",
-
-        tradeId:
-          trade.id,
-
-        symbol:
-          trade.symbol
-
-      }
-
-    );
-
+      return;
+    }
   }
 
-}
 
+  /* SELL */
 
-async function updateOpenTrades() {
-
-  for(
-    const trade
-    of
-    getOpenTrades()
+  if (
+    trade.direction === "SELL"
   ) {
 
-    const live =
-      state.assets[
-        trade.symbol
-      ]?.M5;
+    if (
+      !trade.tp1Hit &&
+      price <= trade.tp1
+    ) {
+
+      trade.tp1Hit = true;
+
+      trade.breakEven = true;
+
+      trade.sl =
+        trade.entry;
+
+      trade.status =
+        "TP1";
+
+      await sendPush(
+
+        `${trade.label} TP1 ✅`,
+
+        `TP1 hit ${trade.tp1}. Move SL to ENTRY ${trade.entry}.`,
+
+        {
+          event:
+            "TP1",
+
+          asset,
+
+          trade
+        }
+      );
+    }
 
 
-    const currentPrice =
-      Number(
-        live?.price
-        ??
-        live?.currentPrice
+    if (
+      !trade.tp2Hit &&
+      price <= trade.tp2
+    ) {
+
+      trade.tp2Hit = true;
+
+      trade.status =
+        "TP2";
+
+      await sendPush(
+
+        `${trade.label} TP2 ✅`,
+
+        `TP2 hit ${trade.tp2}`,
+
+        {
+          event:
+            "TP2",
+
+          asset,
+
+          trade
+        }
+      );
+    }
+
+
+    if (
+      price <= trade.tp3
+    ) {
+
+      trade.tp3Hit = true;
+
+      await sendPush(
+
+        `${trade.label} TP3 ✅`,
+
+        `TP3 hit ${trade.tp3}`,
+
+        {
+          event:
+            "TP3",
+
+          asset,
+
+          trade
+        }
       );
 
 
-    await updateTrade(
-      trade,
-      currentPrice
-    );
+      await closeTrade(
+        asset,
+        trade,
+        "WIN",
+        price
+      );
 
+      return;
+    }
+
+
+    if (
+      price >= trade.sl
+    ) {
+
+      const result =
+        trade.breakEven
+          ? "BREAK-EVEN"
+          : "LOST";
+
+
+      await closeTrade(
+        asset,
+        trade,
+        result,
+        price
+      );
+
+      return;
+    }
   }
-
-}
-
-
-async function maybeOpenNewTrades() {
-
-  for(
-    const symbol
-    of
-    Object.keys(
-      ASSETS
-    )
-  ) {
-
-    if(
-      getOpenTrades()
-        .length
-      >=
-      MAX_OPEN_TRADES
-    ) {
-
-      break;
-
-    }
-
-
-    if(
-      getOpenTradeForAsset(
-        symbol
-      )
-    ) {
-
-      continue;
-
-    }
-
-
-    const candidate =
-      chooseConfirmedCandidate(
-        symbol
-      );
-
-
-    if(
-      candidate
-    ) {
-
-      await createTradeFromSignal(
-        candidate
-      );
-
-    }
-
-  }
-
 }
 
 
 /* =========================
-   MAIN SCAN
+   SCAN ASSET
 ========================= */
 
-async function refreshAll() {
-
-  if(
-    state.running
-  ) {
-
-    return state;
-
-  }
-
-
-  state.running =
-    true;
-
-  state.error =
-    null;
-
-
-  try {
-
-
-    for(
-      const[
-        symbol,
-        asset
-      ]
-      of
-      Object.entries(
-        ASSETS
-      )
-    ) {
-
-
-      for(
-        const[
-          tf,
-          interval
-        ]
-        of
-        Object.entries(
-          TIMEFRAMES
-        )
-      ) {
-
-
-        try {
-
-
-          const candles =
-            await fetchCandles(
-
-              asset.api,
-
-              interval,
-
-              80,
-
-              true
-
-            );
-
-
-          state.assets[
-            symbol
-          ][
-            tf
-          ] =
-            analyze(
-              symbol,
-              tf,
-              candles
-            );
-
-
-        }
-        catch(err) {
-
-
-          console.error(
-            `${symbol} ${tf} error:`,
-            err.message
-          );
-
-
-          state.assets[
-            symbol
-          ][
-            tf
-          ] = {
-
-            symbol,
-
-            asset:
-              symbol,
-
-            timeframe:
-              tf,
-
-            side:
-              "ERROR",
-
-            signal:
-              "ERROR",
-
-            direction:
-              "ERROR",
-
-            confidence:
-              0,
-
-            error:
-              err.message,
-
-            candles: []
-
-          };
-
-        }
-
-      }
-
-
-      const m5 =
-        state.assets[
-          symbol
-        ].M5;
-
-
-      const m15 =
-        state.assets[
-          symbol
-        ].M15;
-
-
-      if(
-        [
-          "BUY",
-          "SELL"
-        ].includes(
-          m5?.side
-        )
-        &&
-        m5.side ===
-        m15?.side
-      ) {
-
-
-        m5.confidence =
-          Math.min(
-            99,
-            m5.confidence + 4
-          );
-
-
-        m15.confidence =
-          Math.min(
-            99,
-            m15.confidence + 4
-          );
-
-      }
-
-    }
-
-
-    await updateOpenTrades();
-
-
-    await maybeOpenNewTrades();
-
-
-    state.updatedAt =
-      nowIso();
-
-
-    console.log(
-
-      "BIT ADAMS scan OK",
-
-      state.updatedAt,
-
-      "open trades:",
-
-      getOpenTrades()
-        .length
-
+async function scanAsset(
+  asset
+) {
+
+  console.log(
+    `Scanning ${asset}...`
+  );
+
+
+  const m5Candles =
+    await getCandles(
+      asset,
+      "M5"
     );
 
 
-  }
-  catch(err) {
+  // Small delay to avoid API burst
+
+  await sleep(500);
 
 
-    state.error =
-      err.message;
-
-
-    console.error(
-      "Scan error:",
-      err
+  const m15Candles =
+    await getCandles(
+      asset,
+      "M15"
     );
 
-
-  }
-  finally {
-
-
-    state.running =
-      false;
-
-
-  }
-
-
-  return state;
-
-}
-
-
-/* =========================
-   PUBLIC FRONT-END DATA
-========================= */
-
-function publicSignal(
-  signal
-) {
-
-  if(
-    !signal
-  ) {
-
-    return null;
-
-  }
-
-
-  return {
-
-    ...signal,
-
-    signal:
-      signal.side,
-
-    direction:
-      signal.side,
-
-    currentPrice:
-      signal.price,
-
-    levels: {
-
-      entry:
-        signal.entry,
-
-      sl:
-        signal.sl,
-
-      stopLoss:
-        signal.sl,
-
-      tp1:
-        signal.tp1,
-
-      tp2:
-        signal.tp2,
-
-      tp3:
-        signal.tp3
-
-    }
-
-  };
-
-}
-
-
-function publicAsset(
-  symbol
-) {
 
   const m5 =
-    publicSignal(
-      state.assets[
-        symbol
-      ].M5
+    analyseTimeframe(
+      asset,
+      "M5",
+      m5Candles
     );
 
 
   const m15 =
-    publicSignal(
-      state.assets[
-        symbol
-      ].M15
+    analyseTimeframe(
+      asset,
+      "M15",
+      m15Candles
     );
 
 
-  const active =
-    getOpenTradeForAsset(
-      symbol
-    );
-
-
-  const candidate =
-    chooseConfirmedCandidate(
-      symbol
-    );
-
-
-  const summary =
-    candidate
-    ||
-    m15
-    ||
-    m5;
-
-
-  return {
-
-    symbol,
-
-    asset:
-      symbol,
-
-    M5:
+  const finalSignal =
+    combineSignals(
+      asset,
       m5,
-
-    M15:
-      m15,
-
-    m5,
-
-    m15,
-
-    timeframes: {
-
-      M5:
-        m5,
-
-      M15:
-        m15
-
-    },
-
-    signal:
-      summary?.side
-      ||
-      summary?.signal
-      ||
-      "WAIT",
-
-    direction:
-      summary?.side
-      ||
-      summary?.direction
-      ||
-      "WAIT",
-
-    confidence:
-      Number(
-        summary?.confidence || 0
-      ),
-
-    price:
-      Number(
-        m5?.price
-        ??
-        m15?.price
-        ??
-        0
-      )
-      ||
-      null,
-
-    currentPrice:
-      Number(
-        m5?.price
-        ??
-        m15?.price
-        ??
-        0
-      )
-      ||
-      null,
-
-    levels:
-
-      active
-
-        ?
-
-        {
-
-          entry:
-            active.entry,
-
-          sl:
-            active.sl,
-
-          stopLoss:
-            active.sl,
-
-          tp1:
-            active.tp1,
-
-          tp2:
-            active.tp2,
-
-          tp3:
-            active.tp3,
-
-          status:
-            active.status
-
-        }
-
-        :
-
-        {
-
-          entry:
-            summary?.entry
-            ??
-            null,
-
-          sl:
-            summary?.sl
-            ??
-            null,
-
-          stopLoss:
-            summary?.sl
-            ??
-            null,
-
-          tp1:
-            summary?.tp1
-            ??
-            null,
-
-          tp2:
-            summary?.tp2
-            ??
-            null,
-
-          tp3:
-            summary?.tp3
-            ??
-            null,
-
-          status:
-
-            summary?.side
-            &&
-            summary.side !== "WAIT"
-
-              ?
-
-              "READY"
-
-              :
-
-              "WAIT"
-
-        },
-
-    status:
-      active?.status
-      ||
-      "WAIT"
-
-  };
-
-}
+      m15
+    );
 
 
-function getPublicState() {
+  signals.set(
+    asset,
+    finalSignal
+  );
 
-  return {
 
-    ok:
-      true,
+  await trackTrade(
+    asset,
+    finalSignal.price
+  );
 
-    updatedAt:
-      state.updatedAt,
 
-    running:
-      state.running,
+  await maybeOpenTrade(
+    asset,
+    finalSignal
+  );
 
-    error:
-      state.error,
 
-    assets: {
-
-      XAUUSD:
-        publicAsset(
-          "XAUUSD"
-        ),
-
-      BTCUSD:
-        publicAsset(
-          "BTCUSD"
-        )
-
-    },
-
-    openTrades:
-      getOpenTrades(),
-
-    history:
-      tradeHistory
-
-  };
-
+  console.log(
+    asset,
+    finalSignal.direction,
+    finalSignal.confidence + "%",
+    "M5",
+    m5.score,
+    "M15",
+    m15.score
+  );
 }
 
 
 /* =========================
-   NORMALIZE
+   SCAN ALL
 ========================= */
 
-function normalizeSymbol(
-  value
-) {
+async function scanAll() {
 
-  const v =
-    String(
-      value || ""
-    )
-    .toUpperCase()
-    .replace(
-      /[^A-Z]/g,
-      ""
+  if (scanning) {
+
+    return;
+  }
+
+
+  if (
+    !TWELVE_DATA_API_KEY
+  ) {
+
+    console.log(
+      "TWELVE_DATA_API_KEY missing"
+    );
+
+    return;
+  }
+
+
+  scanning = true;
+
+
+  try {
+
+    await scanAsset(
+      "XAUUSD"
     );
 
 
-  if(
-    v === "XAUUSD"
-    ||
-    v === "GOLD"
-  ) {
+    await sleep(1000);
 
-    return "XAUUSD";
 
+    await scanAsset(
+      "BTCUSD"
+    );
+
+
+    lastScanAt =
+      nowIso();
+
+
+  } catch (error) {
+
+    console.log(
+      "SCAN ERROR:",
+      error.message
+    );
+
+  } finally {
+
+    scanning = false;
   }
-
-
-  if(
-    v === "BTCUSD"
-    ||
-    v === "BITCOIN"
-    ||
-    v === "BTC"
-  ) {
-
-    return "BTCUSD";
-
-  }
-
-
-  return null;
-
-}
-
-
-function normalizeTimeframe(
-  value
-) {
-
-  const v =
-    String(
-      value || ""
-    )
-    .toUpperCase();
-
-
-  if(
-    v === "M5"
-    ||
-    v === "5MIN"
-    ||
-    v === "5"
-  ) {
-
-    return "M5";
-
-  }
-
-
-  if(
-    v === "M15"
-    ||
-    v === "15MIN"
-    ||
-    v === "15"
-  ) {
-
-    return "M15";
-
-  }
-
-
-  return null;
-
-}
-
-
-async function ensureFresh() {
-
-  const age =
-
-    state.updatedAt
-
-      ?
-
-      Date.now()
-      -
-      new Date(
-        state.updatedAt
-      )
-      .getTime()
-
-      :
-
-      Infinity;
-
-
-  if(
-    age > 45000
-  ) {
-
-    await refreshAll();
-
-  }
-
 }
 
 
 /* =========================
-   ROUTES
+   STATS
+========================= */
+
+function getStats() {
+
+  const wins =
+    history.filter(
+      x => x.status === "WIN"
+    ).length;
+
+
+  const losses =
+    history.filter(
+      x => x.status === "LOST"
+    ).length;
+
+
+  const breakEven =
+    history.filter(
+      x => x.status ===
+        "BREAK-EVEN"
+    ).length;
+
+
+  const completed =
+    wins + losses;
+
+
+  const winRate =
+    completed > 0
+      ? round(
+          wins /
+          completed *
+          100,
+          1
+        )
+      : 0;
+
+
+  return {
+
+    wins,
+
+    losses,
+
+    breakEven,
+
+    winRate,
+
+    totalHistory:
+      history.length,
+
+    openTrades:
+      openTrades.size,
+
+    maxOpenTrades:
+      MAX_OPEN_TRADES
+
+  };
+}
+
+
+/* =========================
+   HOME
 ========================= */
 
 app.get(
   "/",
-  (req,res) => {
+  (req, res) => {
 
     res.json({
 
-      ok:
-        true,
+      app:
+        "BIT ADAMS SERVER",
 
-      name:
-        "BIT ADAMS SERVER V8.4",
+      version:
+        "8.5 FAST",
 
-      assets: [
-        "XAUUSD",
-        "BTCUSD"
-      ],
+      mode:
+        "GOLD + BITCOIN / M5 + M15",
 
-      timeframes: [
-        "M5",
-        "M15"
-      ],
+      minConfidence:
+        MIN_CONFIDENCE,
+
+      scanSeconds:
+        SCAN_SECONDS,
 
       maxOpenTrades:
         MAX_OPEN_TRADES,
 
-      updatedAt:
-        state.updatedAt
+      lastScanAt,
+
+      oneSignal:
+        ONESIGNAL_APP_ID &&
+        ONESIGNAL_API_KEY
+          ? "ready"
+          : "missing",
+
+      status:
+        "online"
 
     });
-
-  }
-);
-
-
-app.get(
-  "/health",
-  (req,res) => {
-
-    res.json({
-
-      ok:
-        true,
-
-      server:
-        "bit-adams-server",
-
-      twelveDataConfigured:
-        Boolean(
-          TWELVE_DATA_API_KEY
-        ),
-
-      oneSignalConfigured:
-        Boolean(
-          ONESIGNAL_APP_ID
-          &&
-          ONESIGNAL_API_KEY
-        ),
-
-      openTrades:
-        getOpenTrades()
-        .length,
-
-      totalTrackedTrades:
-        tradeHistory.length,
-
-      updatedAt:
-        state.updatedAt,
-
-      error:
-        state.error
-
-    });
-
-  }
-);
-
-
-app.get(
-  "/api/market",
-  async(req,res) => {
-
-    await ensureFresh();
-
-    res.json(
-      getPublicState()
-    );
-
-  }
-);
-
-
-app.get(
-  "/api/scan",
-  async(req,res) => {
-
-    await ensureFresh();
-
-    res.json(
-      getPublicState()
-    );
-
-  }
-);
-
-
-app.get(
-  "/api/history",
-  async(req,res) => {
-
-    await ensureFresh();
-
-
-    const wins =
-      tradeHistory.filter(
-        t =>
-          t.status === "WIN"
-      )
-      .length;
-
-
-    const lost =
-      tradeHistory.filter(
-        t =>
-          t.status === "LOST"
-      )
-      .length;
-
-
-    const closed =
-      wins +
-      lost;
-
-
-    res.json({
-
-      ok:
-        true,
-
-      open:
-        getOpenTrades()
-        .length,
-
-      total:
-        tradeHistory.length,
-
-      wins,
-
-      lost,
-
-      breakEven:
-        tradeHistory.filter(
-          t =>
-            t.status ===
-            "BREAK-EVEN"
-        )
-        .length,
-
-      winRate:
-
-        closed
-
-          ?
-
-          Math.round(
-            wins /
-            closed *
-            100
-          )
-
-          :
-
-          0,
-
-      trades:
-        tradeHistory
-
-    });
-
-  }
-);
-
-
-app.get(
-  "/api/analyze",
-  async(req,res) => {
-
-    const symbol =
-      normalizeSymbol(
-        req.query.symbol
-      );
-
-
-    const timeframe =
-      normalizeTimeframe(
-
-        req.query.timeframe
-        ||
-        req.query.tf
-
-      );
-
-
-    if(
-      !symbol
-      ||
-      !timeframe
-    ) {
-
-      return res
-        .status(400)
-        .json({
-
-          ok:
-            false,
-
-          error:
-            "Use symbol=XAUUSD or BTCUSD and timeframe=M5 or M15"
-
-        });
-
-    }
-
-
-    await ensureFresh();
-
-
-    res.json({
-
-      ok:
-        true,
-
-      ...publicSignal(
-        state.assets[
-          symbol
-        ][
-          timeframe
-        ]
-      )
-
-    });
-
   }
 );
 
 
 /* =========================
-   CANDLES FOR CHART
+   HEALTH
 ========================= */
 
 app.get(
-  "/api/candles",
-  async(req,res) => {
+  "/health",
+  (req, res) => {
 
-    const symbol =
-      normalizeSymbol(
-        req.query.symbol
-      );
+    res.json({
+
+      ok: true,
+
+      scanning,
+
+      lastScanAt,
+
+      timestamp:
+        nowIso()
+
+    });
+  }
+);
 
 
-    const timeframe =
-      normalizeTimeframe(
+/* =========================
+   SIGNALS
+========================= */
 
-        req.query.timeframe
-        ||
-        req.query.tf
+app.get(
+  "/api/signals",
+  (req, res) => {
 
-      );
+    const result = {};
 
 
-    if(
-      !symbol
-      ||
-      !timeframe
+    for (
+      const asset
+      of Object.keys(ASSETS)
     ) {
 
-      return res
-        .status(400)
-        .json({
+      result[asset] =
+        signals.get(asset)
+        || {
 
-          ok:
-            false,
+          asset,
 
-          error:
-            "Use symbol=XAUUSD or BTCUSD and timeframe=M5 or M15"
+          label:
+            ASSETS[asset].label,
 
-        });
+          direction:
+            "WAIT",
 
+          confidence:
+            0,
+
+          reason:
+            "WARMING_UP",
+
+          M5: {
+            status:
+              "WAIT"
+          },
+
+          M15: {
+            status:
+              "WAIT"
+          }
+
+        };
     }
-
-
-    await ensureFresh();
-
-
-    const signal =
-      state.assets[
-        symbol
-      ][
-        timeframe
-      ];
 
 
     res.json({
 
-      ok:
-        true,
+      ...result,
 
-      symbol,
+      openTrades:
+        openTrades.size,
 
-      timeframe,
+      maxOpenTrades:
+        MAX_OPEN_TRADES,
 
-      updatedAt:
-        state.updatedAt,
-
-      candles:
-
-        Array.isArray(
-          signal?.candles
-        )
-
-          ?
-
-          signal.candles
-
-          :
-
-          []
+      lastScanAt
 
     });
+  }
+);
 
+
+/* =========================
+   OPEN TRADES
+========================= */
+
+app.get(
+  "/api/open-trades",
+  (req, res) => {
+
+    res.json(
+      Array.from(
+        openTrades.values()
+      )
+    );
+  }
+);
+
+
+/* =========================
+   HISTORY
+========================= */
+
+app.get(
+  "/api/history",
+  (req, res) => {
+
+    res.json({
+
+      stats:
+        getStats(),
+
+      history
+
+    });
+  }
+);
+
+
+/* =========================
+   STATS
+========================= */
+
+app.get(
+  "/api/stats",
+  (req, res) => {
+
+    res.json(
+      getStats()
+    );
+  }
+);
+
+
+/* =========================
+   FORCE SCAN
+========================= */
+
+app.get(
+  "/api/scan",
+  async (req, res) => {
+
+    await scanAll();
+
+    res.json({
+
+      success: true,
+
+      lastScanAt,
+
+      signals:
+        Object.fromEntries(
+          signals
+        )
+
+    });
   }
 );
 
@@ -3377,79 +2074,103 @@ app.get(
    TEST NOTIFICATION
 ========================= */
 
-app.post(
-  "/api/test-notification",
-  async(req,res) => {
+async function testPush(
+  req,
+  res
+) {
 
-    const result =
-      await sendPush(
+  const success =
+    await sendPush(
 
-        "BIT ADAMS TEST",
+      "BIT ADAMS ✅",
 
-        "Notifications from the BIT ADAMS server are working.",
+      "Notifications are working."
 
-        {
-          type:
-            "test"
-        }
-
-      );
-
-
-    res.json(
-      result
     );
 
-  }
+
+  res.json({
+
+    success,
+
+    oneSignal:
+      ONESIGNAL_APP_ID &&
+      ONESIGNAL_API_KEY
+        ? "configured"
+        : "missing"
+
+  });
+}
+
+
+app.get(
+  "/api/test-notification",
+  testPush
+);
+
+
+app.post(
+  "/api/test-notification",
+  testPush
 );
 
 
 /* =========================
-   START SERVER
+   START
 ========================= */
 
 app.listen(
-
   PORT,
-
-  "0.0.0.0",
-
   () => {
 
-
-    console.log(
-      `BIT ADAMS SERVER V8.4 running on port ${PORT}`
-    );
+    loadHistory();
 
 
     console.log(
-      `Scan every ${SCAN_SECONDS}s`
+      "================================"
+    );
+
+    console.log(
+      `BIT ADAMS SERVER PORT ${PORT}`
+    );
+
+    console.log(
+      "FAST M5 + M15"
+    );
+
+    console.log(
+      `MIN CONFIDENCE ${MIN_CONFIDENCE}%`
+    );
+
+    console.log(
+      TWELVE_DATA_API_KEY
+        ? "TWELVE DATA READY"
+        : "TWELVE DATA KEY MISSING"
+    );
+
+    console.log(
+      ONESIGNAL_APP_ID &&
+      ONESIGNAL_API_KEY
+        ? "ONESIGNAL READY"
+        : "ONESIGNAL MISSING"
+    );
+
+    console.log(
+      "================================"
     );
 
 
-    refreshAll()
-      .catch(
-        console.error
-      );
+    // First scan immediately
 
+    scanAll();
+
+
+    // Automatic scan
 
     setInterval(
-
-      () => {
-
-        refreshAll()
-          .catch(
-            console.error
-          );
-
-      },
-
-      SCAN_SECONDS
-      *
-      1000
-
+      scanAll,
+      SCAN_SECONDS * 1000
     );
 
   }
-
 );
