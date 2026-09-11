@@ -9,8 +9,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT =
-  Number(process.env.PORT || 10000);
+const PORT = Number(process.env.PORT || 10000);
 
 const TWELVE_DATA_API_KEY =
   process.env.TWELVE_DATA_API_KEY || "";
@@ -30,8 +29,7 @@ const SCAN_SECONDS =
 const MIN_CONFIDENCE =
   Number(process.env.MIN_CONFIDENCE || 78);
 
-const PUSH_COOLDOWN_MIN =
-  Number(process.env.PUSH_COOLDOWN_MIN || 15);
+const MAX_OPEN_TRADES = 2;
 
 
 /* =========================
@@ -40,14 +38,14 @@ const PUSH_COOLDOWN_MIN =
 
 const ASSETS = {
 
-  XAUUSD:{
-    api:"XAU/USD",
-    label:"GOLD"
+  XAUUSD: {
+    api: "XAU/USD",
+    label: "GOLD"
   },
 
-  BTCUSD:{
-    api:"BTC/USD",
-    label:"BITCOIN"
+  BTCUSD: {
+    api: "BTC/USD",
+    label: "BITCOIN"
   }
 
 };
@@ -55,9 +53,9 @@ const ASSETS = {
 
 const TIMEFRAMES = {
 
-  M5:"5min",
+  M5: "5min",
 
-  M15:"15min"
+  M15: "15min"
 
 };
 
@@ -68,22 +66,22 @@ const TIMEFRAMES = {
 
 const state = {
 
-  updatedAt:null,
+  updatedAt: null,
 
-  running:false,
+  running: false,
 
-  error:null,
+  error: null,
 
-  assets:{
+  assets: {
 
-    XAUUSD:{
-      M5:null,
-      M15:null
+    XAUUSD: {
+      M5: null,
+      M15: null
     },
 
-    BTCUSD:{
-      M5:null,
-      M15:null
+    BTCUSD: {
+      M5: null,
+      M15: null
     }
 
   }
@@ -91,10 +89,9 @@ const state = {
 };
 
 
-const candleCache =
-  new Map();
+const candleCache = new Map();
 
-const lastPush =
+const acceptedSignalFingerprints =
   new Map();
 
 let apiRequestTimes = [];
@@ -102,13 +99,104 @@ let apiRequestTimes = [];
 let apiGate =
   Promise.resolve();
 
+let tradeHistory = [];
 
-function sleep(ms){
+
+/* =========================
+   HELPERS
+========================= */
+
+function sleep(ms) {
 
   return new Promise(
-    resolve=>
-    setTimeout(resolve,ms)
+    resolve =>
+      setTimeout(resolve, ms)
   );
+
+}
+
+
+function nowIso() {
+
+  return new Date()
+    .toISOString();
+
+}
+
+
+function isOpenStatus(status) {
+
+  return [
+    "OPEN",
+    "TP1",
+    "TP2"
+  ].includes(
+    String(status || "")
+      .toUpperCase()
+  );
+
+}
+
+
+function getOpenTrades() {
+
+  return tradeHistory.filter(
+    t =>
+      isOpenStatus(t.status)
+  );
+
+}
+
+
+function getOpenTradeForAsset(
+  symbol
+) {
+
+  return (
+    tradeHistory.find(
+      t =>
+        t.symbol === symbol &&
+        isOpenStatus(t.status)
+    ) || null
+  );
+
+}
+
+
+function roundPrice(value) {
+
+  if(
+    !Number.isFinite(
+      Number(value)
+    )
+  ) {
+
+    return null;
+
+  }
+
+  return Number(
+    Number(value)
+      .toFixed(2)
+  );
+
+}
+
+
+function priceText(value) {
+
+  if(
+    !Number.isFinite(
+      Number(value)
+    )
+  ) {
+
+    return "—";
+
+  }
+
+  return Number(value)
+    .toFixed(2);
 
 }
 
@@ -118,54 +206,59 @@ function sleep(ms){
    MAX 8 / MINUTE
 ========================= */
 
-async function reserveApiCredit(){
+async function reserveApiCredit() {
 
   const run =
-  apiGate.then(async()=>{
+    apiGate.then(
+      async () => {
 
-    while(true){
+        while(true) {
 
-      const now =
-        Date.now();
+          const now =
+            Date.now();
 
-      apiRequestTimes =
-      apiRequestTimes.filter(
-        t=>
-        now-t<60000
-      );
+          apiRequestTimes =
+            apiRequestTimes.filter(
+              t =>
+                now - t < 60000
+            );
 
-      if(
-        apiRequestTimes.length<8
-      ){
+          if(
+            apiRequestTimes.length < 8
+          ) {
 
-        apiRequestTimes.push(
-          Date.now()
-        );
+            apiRequestTimes.push(
+              Date.now()
+            );
 
-        return;
+            return;
+
+          }
+
+          const wait =
+            Math.max(
+              500,
+              60000 -
+              (
+                now -
+                apiRequestTimes[0]
+              )
+              +
+              400
+            );
+
+          await sleep(wait);
+
+        }
 
       }
-
-      const wait =
-        Math.max(
-          500,
-          60000-
-          (
-            now-
-            apiRequestTimes[0]
-          )
-          +400
-        );
-
-      await sleep(wait);
-
-    }
-
-  });
+    );
 
 
   apiGate =
-    run.catch(()=>{});
+    run.catch(
+      () => {}
+    );
 
   return run;
 
@@ -176,49 +269,40 @@ async function reserveApiCredit(){
    INDICATORS
 ========================= */
 
-function roundPrice(value){
-
-  if(
-    !Number.isFinite(
-      Number(value)
-    )
-  ){
-    return null;
-  }
-
-  return Number(
-    Number(value)
-    .toFixed(2)
-  );
-
-}
-
-
 function emaSeries(
   values,
   period
-){
+) {
 
-  if(!values.length)
-    return[];
+  if(
+    !values.length
+  ) {
+
+    return [];
+
+  }
 
   const k =
-    2/(period+1);
+    2 /
+    (
+      period + 1
+    );
 
   const out =
     [values[0]];
 
   for(
-    let i=1;
-    i<values.length;
+    let i = 1;
+    i < values.length;
     i++
-  ){
+  ) {
 
     out.push(
 
-      values[i]*k
+      values[i] * k
       +
-      out[i-1]*(1-k)
+      out[i - 1] *
+      (1 - k)
 
     );
 
@@ -231,61 +315,79 @@ function emaSeries(
 
 function rsi(
   values,
-  period=14
-){
+  period = 14
+) {
 
   if(
     !Array.isArray(values)
     ||
-    values.length<=period
-  ){
+    values.length <= period
+  ) {
+
     return 50;
+
   }
 
-  let gains=0;
-  let losses=0;
+  let gains = 0;
+
+  let losses = 0;
 
   for(
-    let i=
-    values.length-period;
-    i<values.length;
+    let i =
+      values.length - period;
+    i < values.length;
     i++
-  ){
+  ) {
 
     const change =
-      values[i]-
-      values[i-1];
+      values[i] -
+      values[i - 1];
 
-    if(change>=0){
+    if(
+      change >= 0
+    ) {
 
-      gains+=change;
+      gains +=
+        change;
 
     }
+    else {
 
-    else{
-
-      losses+=
-      Math.abs(change);
+      losses +=
+        Math.abs(change);
 
     }
 
   }
 
+
   const avgGain =
-    gains/period;
+    gains / period;
 
   const avgLoss =
-    losses/period;
+    losses / period;
 
-  if(avgLoss===0)
+
+  if(
+    avgLoss === 0
+  ) {
+
     return 100;
 
-  const rs =
-    avgGain/avgLoss;
+  }
 
-  return(
-    100-
-    100/(1+rs)
+
+  const rs =
+    avgGain /
+    avgLoss;
+
+
+  return (
+    100 -
+    100 /
+    (
+      1 + rs
+    )
   );
 
 }
@@ -293,46 +395,51 @@ function rsi(
 
 function atr(
   candles,
-  period=14
-){
+  period = 14
+) {
 
   if(
     !Array.isArray(candles)
     ||
-    candles.length<=period
-  ){
+    candles.length <= period
+  ) {
+
     return 0;
+
   }
 
-  const trs=[];
+
+  const trs = [];
+
 
   for(
-    let i=
-    candles.length-period;
-    i<candles.length;
+    let i =
+      candles.length - period;
+    i < candles.length;
     i++
-  ){
+  ) {
 
     const current =
       candles[i];
 
     const previous =
-      candles[i-1];
+      candles[i - 1];
+
 
     trs.push(
 
       Math.max(
 
-        current.high-
+        current.high -
         current.low,
 
         Math.abs(
-          current.high-
+          current.high -
           previous.close
         ),
 
         Math.abs(
-          current.low-
+          current.low -
           previous.close
         )
 
@@ -342,9 +449,11 @@ function atr(
 
   }
 
-  return(
+
+  return (
     trs.reduce(
-      (a,b)=>a+b,
+      (a, b) =>
+        a + b,
       0
     )
     /
@@ -356,31 +465,35 @@ function atr(
 
 function slope(
   values,
-  lookback=5
-){
+  lookback = 5
+) {
 
   if(
     !Array.isArray(values)
     ||
-    values.length<
-    lookback+1
-  ){
+    values.length <
+    lookback + 1
+  ) {
+
     return 0;
+
   }
+
 
   const a =
     values.at(-1);
 
   const b =
     values[
-      values.length-
-      1-
+      values.length -
+      1 -
       lookback
     ];
 
-  return(
+
+  return (
     (
-      a-b
+      a - b
     )
     /
     Math.max(
@@ -394,19 +507,20 @@ function slope(
 }
 
 
-function macd(values){
+function macd(values) {
 
   if(
-    values.length<35
-  ){
+    values.length < 35
+  ) {
 
-    return{
-      line:0,
-      signal:0,
-      hist:0
+    return {
+      line: 0,
+      signal: 0,
+      hist: 0
     };
 
   }
+
 
   const e12 =
     emaSeries(
@@ -420,11 +534,14 @@ function macd(values){
       26
     );
 
+
   const lineSeries =
     values.map(
-      (_,i)=>
-      e12[i]-e26[i]
+      (_, i) =>
+        e12[i] -
+        e26[i]
     );
+
 
   const signalSeries =
     emaSeries(
@@ -432,7 +549,8 @@ function macd(values){
       9
     );
 
-  return{
+
+  return {
 
     line:
       lineSeries.at(-1),
@@ -457,13 +575,13 @@ function macd(values){
 async function fetchCandles(
   apiSymbol,
   interval,
-  outputsize=80,
-  force=false
-){
+  outputsize = 80,
+  force = false
+) {
 
   if(
     !TWELVE_DATA_API_KEY
-  ){
+  ) {
 
     throw new Error(
       "TWELVE_DATA_API_KEY is missing"
@@ -487,17 +605,16 @@ async function fetchCandles(
     &&
     cached
     &&
-    Date.now()-
-    cached.time
-    <
+    Date.now() -
+    cached.time <
     45000
-  ){
+  ) {
 
-    return(
+    return (
       cached.candles
-      .slice(
-        -outputsize
-      )
+        .slice(
+          -outputsize
+        )
     );
 
   }
@@ -542,9 +659,9 @@ async function fetchCandles(
     await fetch(
       url,
       {
-        headers:{
+        headers: {
           Accept:
-          "application/json"
+            "application/json"
         }
       }
     );
@@ -552,21 +669,21 @@ async function fetchCandles(
 
   const data =
     await response
-    .json()
-    .catch(
-      ()=>({})
-    );
+      .json()
+      .catch(
+        () => ({})
+      );
 
 
   if(
     !response.ok
     ||
-    data.status==="error"
+    data.status === "error"
     ||
     !Array.isArray(
       data.values
     )
-  ){
+  ) {
 
     throw new Error(
 
@@ -584,41 +701,41 @@ async function fetchCandles(
   const candles =
     data.values
 
-    .map(
-      v=>({
+      .map(
+        v => ({
 
-        datetime:
-          v.datetime,
+          datetime:
+            v.datetime,
 
-        open:
-          Number(v.open),
+          open:
+            Number(v.open),
 
-        high:
-          Number(v.high),
+          high:
+            Number(v.high),
 
-        low:
-          Number(v.low),
+          low:
+            Number(v.low),
 
-        close:
-          Number(v.close)
+          close:
+            Number(v.close)
 
-      })
-    )
-
-    .filter(
-      c=>
-      [
-        c.open,
-        c.high,
-        c.low,
-        c.close
-      ]
-      .every(
-        Number.isFinite
+        })
       )
-    )
 
-    .reverse();
+      .filter(
+        c =>
+          [
+            c.open,
+            c.high,
+            c.low,
+            c.close
+          ]
+          .every(
+            Number.isFinite
+          )
+      )
+
+      .reverse();
 
 
   candleCache.set(
@@ -632,7 +749,7 @@ async function fetchCandles(
   );
 
 
-  return(
+  return (
     candles.slice(
       -outputsize
     )
@@ -649,13 +766,13 @@ function analyze(
   symbol,
   timeframe,
   candles
-){
+) {
 
   if(
     !Array.isArray(candles)
     ||
-    candles.length<50
-  ){
+    candles.length < 50
+  ) {
 
     throw new Error(
       "Not enough candles"
@@ -666,7 +783,8 @@ function analyze(
 
   const closes =
     candles.map(
-      c=>c.close
+      c =>
+        c.close
     );
 
 
@@ -742,21 +860,22 @@ function analyze(
 
   const body =
     Math.abs(
-      latest.close-
+      latest.close -
       latest.open
     );
 
 
   const range =
     Math.max(
-      latest.high-
+      latest.high -
       latest.low,
       1e-9
     );
 
 
   const bodyRatio =
-    body/range;
+    body /
+    range;
 
 
   const atrPct =
@@ -770,189 +889,214 @@ function analyze(
     100;
 
 
-  let buy=0;
+  let buy = 0;
 
-  let sell=0;
-
-
-  if(fast>slow)
-    buy+=18;
-  else
-    sell+=18;
-
-
-  if(slow>long)
-    buy+=15;
-  else
-    sell+=15;
-
-
-  if(latest.close>fast)
-    buy+=9;
-  else
-    sell+=9;
-
-
-  if(latest.close>slow)
-    buy+=7;
-  else
-    sell+=7;
+  let sell = 0;
 
 
   if(
-    trendSlope>0.010
-  ){
+    fast > slow
+  ) {
 
-    buy+=10;
+    buy += 18;
+
+  }
+  else {
+
+    sell += 18;
 
   }
 
+
+  if(
+    slow > long
+  ) {
+
+    buy += 15;
+
+  }
+  else {
+
+    sell += 15;
+
+  }
+
+
+  if(
+    latest.close > fast
+  ) {
+
+    buy += 9;
+
+  }
+  else {
+
+    sell += 9;
+
+  }
+
+
+  if(
+    latest.close > slow
+  ) {
+
+    buy += 7;
+
+  }
+  else {
+
+    sell += 7;
+
+  }
+
+
+  if(
+    trendSlope > 0.010
+  ) {
+
+    buy += 10;
+
+  }
   else if(
-    trendSlope<-0.010
-  ){
+    trendSlope < -0.010
+  ) {
 
-    sell+=10;
+    sell += 10;
 
   }
 
 
   if(
-    rsi14>=52
+    rsi14 >= 52
     &&
-    rsi14<=70
-  ){
+    rsi14 <= 70
+  ) {
 
-    buy+=13;
+    buy += 13;
 
   }
-
   else if(
-    rsi14<=48
+    rsi14 <= 48
     &&
-    rsi14>=30
-  ){
+    rsi14 >= 30
+  ) {
 
-    sell+=13;
-
-  }
-
-  else if(
-    rsi14>72
-  ){
-
-    sell+=3;
+    sell += 13;
 
   }
-
   else if(
-    rsi14<28
-  ){
+    rsi14 > 72
+  ) {
 
-    buy+=3;
+    sell += 3;
+
+  }
+  else if(
+    rsi14 < 28
+  ) {
+
+    buy += 3;
 
   }
 
 
   if(
-    momentum>0.015
-  ){
+    momentum > 0.015
+  ) {
 
-    buy+=10;
+    buy += 10;
 
   }
-
   else if(
-    momentum<-0.015
-  ){
+    momentum < -0.015
+  ) {
 
-    sell+=10;
+    sell += 10;
 
   }
 
 
   if(
-    M.hist>0
+    M.hist > 0
     &&
-    M.line>M.signal
-  ){
+    M.line > M.signal
+  ) {
 
-    buy+=10;
+    buy += 10;
 
   }
-
   else if(
-    M.hist<0
+    M.hist < 0
     &&
-    M.line<M.signal
-  ){
+    M.line < M.signal
+  ) {
 
-    sell+=10;
+    sell += 10;
 
   }
 
 
   if(
-    latest.close>
+    latest.close >
     latest.open
-  ){
+  ) {
 
-    buy+=4;
+    buy += 4;
 
   }
 
 
   if(
-    latest.close<
+    latest.close <
     latest.open
-  ){
+  ) {
 
-    sell+=4;
+    sell += 4;
 
   }
 
 
   if(
-    latest.close>
+    latest.close >
     latest.open
     &&
-    previous.close>
+    previous.close >
     previous.open
-  ){
+  ) {
 
-    buy+=4;
+    buy += 4;
 
   }
 
 
   if(
-    latest.close<
+    latest.close <
     latest.open
     &&
-    previous.close<
+    previous.close <
     previous.open
-  ){
+  ) {
 
-    sell+=4;
+    sell += 4;
 
   }
 
 
   if(
-    bodyRatio>0.50
-  ){
+    bodyRatio > 0.50
+  ) {
 
     if(
-      latest.close>
+      latest.close >
       latest.open
-    ){
+    ) {
 
-      buy+=5;
+      buy += 5;
 
     }
+    else {
 
-    else{
-
-      sell+=5;
+      sell += 5;
 
     }
 
@@ -968,34 +1112,35 @@ function analyze(
 
   const difference =
     Math.abs(
-      buy-sell
+      buy -
+      sell
     );
 
 
   const buyTrend =
 
-    fast>slow
+    fast > slow
     &&
-    latest.close>slow
+    latest.close > slow
     &&
-    trendSlope>=0;
+    trendSlope >= 0;
 
 
   const sellTrend =
 
-    fast<slow
+    fast < slow
     &&
-    latest.close<slow
+    latest.close < slow
     &&
-    trendSlope<=0;
+    trendSlope <= 0;
 
 
   const volatilityOK =
 
-    atrPct>=(
-      symbol==="BTCUSD"
-      ? 0.06
-      : 0.018
+    atrPct >= (
+      symbol === "BTCUSD"
+        ? 0.06
+        : 0.018
     );
 
 
@@ -1006,18 +1151,19 @@ function analyze(
   if(
     volatilityOK
     &&
-    buy>=60
+    buy >= 60
     &&
-    difference>=10
+    difference >= 10
     &&
     buyTrend
     &&
-    rsi14<74
+    rsi14 < 74
     &&
-    momentum>-0.015
-  ){
+    momentum > -0.015
+  ) {
 
-    side="BUY";
+    side =
+      "BUY";
 
   }
 
@@ -1025,58 +1171,59 @@ function analyze(
   if(
     volatilityOK
     &&
-    sell>=60
+    sell >= 60
     &&
-    difference>=10
+    difference >= 10
     &&
     sellTrend
     &&
-    rsi14>26
+    rsi14 > 26
     &&
-    momentum<0.015
-  ){
+    momentum < 0.015
+  ) {
 
-    side="SELL";
+    side =
+      "SELL";
 
   }
 
 
   const confidence =
 
-    side==="WAIT"
+    side === "WAIT"
 
-    ?
+      ?
 
-    Math.round(
-
-      Math.min(
-        72,
-        45+
-        dominant*0.25
-      )
-
-    )
-
-    :
-
-    Math.round(
-
-      Math.max(
-        72,
+      Math.round(
 
         Math.min(
-          96,
-
-          58
-          +
-          dominant*0.34
-          +
-          difference*0.10
+          72,
+          45 +
+          dominant * 0.25
         )
 
       )
 
-    );
+      :
+
+      Math.round(
+
+        Math.max(
+          72,
+
+          Math.min(
+            96,
+
+            58
+            +
+            dominant * 0.34
+            +
+            difference * 0.10
+          )
+
+        )
+
+      );
 
 
   const entry =
@@ -1085,95 +1232,97 @@ function analyze(
 
   const atrFloor =
 
-    entry*(
+    entry * (
 
-      symbol==="BTCUSD"
+      symbol === "BTCUSD"
 
-      ? 0.0011
+        ? 0.0011
 
-      : 0.0008
+        : 0.0008
 
     );
 
 
   const risk =
     Math.max(
-      atr14*1.10,
+      atr14 * 1.10,
       atrFloor
     );
 
 
-  let sl=null;
+  let sl = null;
 
-  let tp1=null;
+  let tp1 = null;
 
-  let tp2=null;
+  let tp2 = null;
 
-  let tp3=null;
+  let tp3 = null;
 
 
   if(
-    side==="BUY"
-  ){
+    side === "BUY"
+  ) {
 
-    sl=
-      entry-risk;
+    sl =
+      entry -
+      risk;
 
-    tp1=
-      entry+
-      risk*0.85;
+    tp1 =
+      entry +
+      risk * 0.85;
 
-    tp2=
-      entry+
-      risk*1.45;
+    tp2 =
+      entry +
+      risk * 1.45;
 
-    tp3=
-      entry+
-      risk*2.20;
+    tp3 =
+      entry +
+      risk * 2.20;
 
   }
 
 
   if(
-    side==="SELL"
-  ){
+    side === "SELL"
+  ) {
 
-    sl=
-      entry+risk;
+    sl =
+      entry +
+      risk;
 
-    tp1=
-      entry-
-      risk*0.85;
+    tp1 =
+      entry -
+      risk * 0.85;
 
-    tp2=
-      entry-
-      risk*1.45;
+    tp2 =
+      entry -
+      risk * 1.45;
 
-    tp3=
-      entry-
-      risk*2.20;
+    tp3 =
+      entry -
+      risk * 2.20;
 
   }
 
 
   const quality =
 
-    side==="WAIT"
+    side === "WAIT"
 
-    ? "WAIT"
+      ? "WAIT"
 
-    : confidence>=90
+      : confidence >= 90
 
-    ? "EXCELLENT"
+        ? "EXCELLENT"
 
-    : confidence>=82
+        : confidence >= 82
 
-    ? "STRONG"
+          ? "STRONG"
 
-    : "VALID";
+          : "VALID";
 
 
-  return{
+  return {
 
     symbol,
 
@@ -1183,6 +1332,9 @@ function analyze(
     timeframe,
 
     side,
+
+    signal:
+      side,
 
     direction:
       side,
@@ -1196,14 +1348,24 @@ function analyze(
         entry
       ),
 
+    currentPrice:
+      roundPrice(
+        entry
+      ),
+
     entry:
-      side==="WAIT"
-      ? null
-      : roundPrice(
-          entry
-        ),
+      side === "WAIT"
+        ? null
+        : roundPrice(
+            entry
+          ),
 
     sl:
+      roundPrice(
+        sl
+      ),
+
+    stopLoss:
       roundPrice(
         sl
       ),
@@ -1222,6 +1384,42 @@ function analyze(
       roundPrice(
         tp3
       ),
+
+    levels: {
+
+      entry:
+        side === "WAIT"
+          ? null
+          : roundPrice(
+              entry
+            ),
+
+      sl:
+        roundPrice(
+          sl
+        ),
+
+      stopLoss:
+        roundPrice(
+          sl
+        ),
+
+      tp1:
+        roundPrice(
+          tp1
+        ),
+
+      tp2:
+        roundPrice(
+          tp2
+        ),
+
+      tp3:
+        roundPrice(
+          tp3
+        )
+
+    },
 
     rsi14:
       Number(
@@ -1267,244 +1465,932 @@ function analyze(
 async function sendPush(
   title,
   message,
-  data={}
-){
+  data = {}
+) {
 
   if(
     !ONESIGNAL_APP_ID
     ||
     !ONESIGNAL_API_KEY
-  ){
+  ) {
 
     console.log(
       "OneSignal skipped - keys missing"
     );
 
-    return{
-      skipped:true
+    return {
+      skipped: true
     };
 
   }
 
 
-  const response =
-    await fetch(
+  try {
 
-      "https://api.onesignal.com/notifications",
+    const response =
+      await fetch(
+
+        "https://api.onesignal.com/notifications",
+
+        {
+
+          method: "POST",
+
+          headers: {
+
+            "Content-Type":
+              "application/json",
+
+            "Authorization":
+              `Key ${ONESIGNAL_API_KEY}`
+
+          },
+
+          body:
+            JSON.stringify({
+
+              app_id:
+                ONESIGNAL_APP_ID,
+
+              target_channel:
+                "push",
+
+              included_segments:
+                [
+                  "Subscribed Users"
+                ],
+
+              headings: {
+                en:
+                  title
+              },
+
+              contents: {
+                en:
+                  message
+              },
+
+              data
+
+            })
+
+        }
+
+      );
+
+
+    const body =
+      await response
+        .json()
+        .catch(
+          () => ({})
+        );
+
+
+    if(
+      !response.ok
+    ) {
+
+      console.error(
+        "OneSignal error:",
+        body
+      );
+
+
+      return {
+
+        ok:
+          false,
+
+        status:
+          response.status,
+
+        body
+
+      };
+
+    }
+
+
+    console.log(
+      "OneSignal sent:",
+      title
+    );
+
+
+    return {
+
+      ok:
+        true,
+
+      body
+
+    };
+
+  }
+  catch(error) {
+
+    console.error(
+      "OneSignal request failed:",
+      error.message
+    );
+
+
+    return {
+
+      ok:
+        false,
+
+      error:
+        error.message
+
+    };
+
+  }
+
+}
+
+
+/* =========================
+   TRADE TRACKER
+========================= */
+
+function chooseConfirmedCandidate(
+  symbol
+) {
+
+  const asset =
+    state.assets[
+      symbol
+    ];
+
+
+  const m5 =
+    asset?.M5;
+
+  const m15 =
+    asset?.M15;
+
+
+  const m5Valid =
+
+    [
+      "BUY",
+      "SELL"
+    ].includes(
+      m5?.side
+    )
+
+    &&
+
+    Number(
+      m5?.confidence || 0
+    )
+    >=
+    MIN_CONFIDENCE;
+
+
+  const m15Valid =
+
+    [
+      "BUY",
+      "SELL"
+    ].includes(
+      m15?.side
+    )
+
+    &&
+
+    Number(
+      m15?.confidence || 0
+    )
+    >=
+    MIN_CONFIDENCE;
+
+
+  if(
+    m5Valid
+    &&
+    m15Valid
+    &&
+    m5.side !== m15.side
+  ) {
+
+    return null;
+
+  }
+
+
+  if(
+    m5Valid
+    &&
+    m15Valid
+  ) {
+
+    const best =
+
+      Number(
+        m15.confidence
+      )
+
+      >
+
+      Number(
+        m5.confidence
+      )
+
+        ?
+
+        m15
+
+        :
+
+        m5;
+
+
+    return {
+
+      ...best,
+
+      mtfConfirmed:
+        true
+
+    };
+
+  }
+
+
+  if(
+    m15Valid
+  ) {
+
+    return {
+
+      ...m15,
+
+      mtfConfirmed:
+        false
+
+    };
+
+  }
+
+
+  if(
+    m5Valid
+  ) {
+
+    return {
+
+      ...m5,
+
+      mtfConfirmed:
+        false
+
+    };
+
+  }
+
+
+  return null;
+
+}
+
+
+function signalFingerprint(
+  signal
+) {
+
+  return [
+
+    signal.symbol,
+
+    signal.timeframe,
+
+    signal.side,
+
+    signal.candleTime
+
+  ].join("|");
+
+}
+
+
+async function createTradeFromSignal(
+  signal
+) {
+
+  if(
+    !signal
+  ) {
+
+    return null;
+
+  }
+
+
+  if(
+    getOpenTrades()
+      .length
+    >=
+    MAX_OPEN_TRADES
+  ) {
+
+    return null;
+
+  }
+
+
+  if(
+    getOpenTradeForAsset(
+      signal.symbol
+    )
+  ) {
+
+    return null;
+
+  }
+
+
+  const fingerprint =
+    signalFingerprint(
+      signal
+    );
+
+
+  const lastFingerprint =
+    acceptedSignalFingerprints.get(
+      signal.symbol
+    );
+
+
+  if(
+    lastFingerprint ===
+    fingerprint
+  ) {
+
+    return null;
+
+  }
+
+
+  acceptedSignalFingerprints.set(
+    signal.symbol,
+    fingerprint
+  );
+
+
+  const trade = {
+
+    id:
+      `${Date.now()}-${signal.symbol}`,
+
+    symbol:
+      signal.symbol,
+
+    asset:
+      signal.symbol,
+
+    direction:
+      signal.side,
+
+    side:
+      signal.side,
+
+    timeframe:
+      signal.timeframe,
+
+    mtfConfirmed:
+      Boolean(
+        signal.mtfConfirmed
+      ),
+
+    confidence:
+      signal.confidence,
+
+    entry:
+      signal.entry,
+
+    originalSl:
+      signal.sl,
+
+    sl:
+      signal.sl,
+
+    tp1:
+      signal.tp1,
+
+    tp2:
+      signal.tp2,
+
+    tp3:
+      signal.tp3,
+
+    status:
+      "OPEN",
+
+    tp1Hit:
+      false,
+
+    tp2Hit:
+      false,
+
+    tp3Hit:
+      false,
+
+    breakEvenActive:
+      false,
+
+    createdAt:
+      nowIso(),
+
+    updatedAt:
+      nowIso()
+
+  };
+
+
+  tradeHistory.unshift(
+    trade
+  );
+
+
+  tradeHistory =
+    tradeHistory.slice(
+      0,
+      300
+    );
+
+
+  const mtfText =
+
+    trade.mtfConfirmed
+
+      ?
+
+      " • M5+M15 confirmed"
+
+      :
+
+      "";
+
+
+  await sendPush(
+
+    `BIT ADAMS • ${trade.direction} ${trade.symbol}`,
+
+    `${trade.timeframe}${mtfText} • Confidence ${trade.confidence}% • Entry ${priceText(trade.entry)} • SL ${priceText(trade.sl)} • TP1 ${priceText(trade.tp1)} • TP2 ${priceText(trade.tp2)} • TP3 ${priceText(trade.tp3)}`,
+
+    {
+
+      type:
+        "signal",
+
+      tradeId:
+        trade.id,
+
+      symbol:
+        trade.symbol,
+
+      timeframe:
+        trade.timeframe,
+
+      side:
+        trade.direction,
+
+      confidence:
+        trade.confidence,
+
+      entry:
+        trade.entry,
+
+      sl:
+        trade.sl,
+
+      tp1:
+        trade.tp1,
+
+      tp2:
+        trade.tp2,
+
+      tp3:
+        trade.tp3
+
+    }
+
+  );
+
+
+  return trade;
+
+}
+
+
+async function updateTrade(
+  trade,
+  currentPrice
+) {
+
+  if(
+    !trade
+    ||
+    !isOpenStatus(
+      trade.status
+    )
+    ||
+    !Number.isFinite(
+      Number(currentPrice)
+    )
+  ) {
+
+    return;
+
+  }
+
+
+  const price =
+    Number(
+      currentPrice
+    );
+
+
+  const isBuy =
+    trade.direction ===
+    "BUY";
+
+
+  const profitHit =
+    level =>
+      isBuy
+
+        ?
+
+        price >=
+        Number(level)
+
+        :
+
+        price <=
+        Number(level);
+
+
+  const stopHit =
+    level =>
+      isBuy
+
+        ?
+
+        price <=
+        Number(level)
+
+        :
+
+        price >=
+        Number(level);
+
+
+  if(
+    !trade.tp1Hit
+    &&
+    stopHit(
+      trade.originalSl
+    )
+  ) {
+
+    trade.status =
+      "LOST";
+
+    trade.closePrice =
+      roundPrice(
+        price
+      );
+
+    trade.closedAt =
+      nowIso();
+
+    trade.updatedAt =
+      nowIso();
+
+
+    await sendPush(
+
+      `BIT ADAMS • SL ${trade.symbol}`,
+
+      `${trade.direction} ${trade.timeframe} • LOST • Close ${priceText(price)}`,
 
       {
 
-        method:"POST",
+        type:
+          "lost",
 
-        headers:{
+        tradeId:
+          trade.id,
 
-          "Content-Type":
-            "application/json",
-
-          "Authorization":
-            `Key ${ONESIGNAL_API_KEY}`
-
-        },
-
-        body:
-          JSON.stringify({
-
-            app_id:
-              ONESIGNAL_APP_ID,
-
-            target_channel:
-              "push",
-
-            included_segments:
-              [
-                "Subscribed Users"
-              ],
-
-            headings:{
-              en:title
-            },
-
-            contents:{
-              en:message
-            },
-
-            data
-
-          })
+        symbol:
+          trade.symbol
 
       }
 
     );
 
 
-  const body =
-    await response
-    .json()
-    .catch(
-      ()=>({})
-    );
-
-
-  if(
-    !response.ok
-  ){
-
-    console.error(
-      "OneSignal error:",
-      body
-    );
-
-    return{
-
-      ok:false,
-
-      status:
-        response.status,
-
-      body
-
-    };
+    return;
 
   }
 
 
-  console.log(
-    "OneSignal sent:",
-    title
-  );
+  if(
+    !trade.tp1Hit
+    &&
+    profitHit(
+      trade.tp1
+    )
+  ) {
+
+    trade.tp1Hit =
+      true;
+
+    trade.breakEvenActive =
+      true;
+
+    trade.sl =
+      trade.entry;
+
+    trade.status =
+      "TP1";
+
+    trade.tp1At =
+      nowIso();
+
+    trade.updatedAt =
+      nowIso();
 
 
-  return{
+    await sendPush(
 
-    ok:true,
+      `BIT ADAMS • TP1 ${trade.symbol}`,
 
-    body
+      `TP1 hit ✅ • Move SL to ENTRY ${priceText(trade.entry)} • BREAK-EVEN protection ON`,
 
-  };
+      {
+
+        type:
+          "tp1",
+
+        tradeId:
+          trade.id,
+
+        symbol:
+          trade.symbol,
+
+        entry:
+          trade.entry
+
+      }
+
+    );
+
+  }
+
+
+  if(
+    trade.tp1Hit
+    &&
+    !trade.tp2Hit
+    &&
+    profitHit(
+      trade.tp2
+    )
+  ) {
+
+    trade.tp2Hit =
+      true;
+
+    trade.status =
+      "TP2";
+
+    trade.tp2At =
+      nowIso();
+
+    trade.updatedAt =
+      nowIso();
+
+
+    await sendPush(
+
+      `BIT ADAMS • TP2 ${trade.symbol}`,
+
+      `${trade.direction} ${trade.timeframe} • TP2 hit ✅`,
+
+      {
+
+        type:
+          "tp2",
+
+        tradeId:
+          trade.id,
+
+        symbol:
+          trade.symbol
+
+      }
+
+    );
+
+  }
+
+
+  if(
+    trade.tp1Hit
+    &&
+    !trade.tp3Hit
+    &&
+    profitHit(
+      trade.tp3
+    )
+  ) {
+
+    trade.tp3Hit =
+      true;
+
+    trade.status =
+      "WIN";
+
+    trade.closePrice =
+      roundPrice(
+        price
+      );
+
+    trade.tp3At =
+      nowIso();
+
+    trade.closedAt =
+      nowIso();
+
+    trade.updatedAt =
+      nowIso();
+
+
+    await sendPush(
+
+      `BIT ADAMS • TP3 / WIN ${trade.symbol}`,
+
+      `${trade.direction} ${trade.timeframe} • TP3 hit 🏆 • WIN`,
+
+      {
+
+        type:
+          "win",
+
+        tradeId:
+          trade.id,
+
+        symbol:
+          trade.symbol
+
+      }
+
+    );
+
+
+    return;
+
+  }
+
+
+  if(
+    trade.tp1Hit
+    &&
+    trade.breakEvenActive
+    &&
+    stopHit(
+      trade.entry
+    )
+  ) {
+
+    trade.status =
+      "BREAK-EVEN";
+
+    trade.closePrice =
+      roundPrice(
+        price
+      );
+
+    trade.closedAt =
+      nowIso();
+
+    trade.updatedAt =
+      nowIso();
+
+
+    await sendPush(
+
+      `BIT ADAMS • BREAK-EVEN ${trade.symbol}`,
+
+      `${trade.direction} ${trade.timeframe} • Closed at ENTRY ${priceText(trade.entry)}`,
+
+      {
+
+        type:
+          "break_even",
+
+        tradeId:
+          trade.id,
+
+        symbol:
+          trade.symbol
+
+      }
+
+    );
+
+  }
 
 }
 
 
-/* =========================
-   SIGNAL NOTIFICATION
-========================= */
+async function updateOpenTrades() {
 
-async function maybeNotify(
-  signal
-){
+  for(
+    const trade
+    of
+    getOpenTrades()
+  ) {
 
-  if(
-    !signal
-    ||
-    signal.side==="WAIT"
-    ||
-    signal.confidence<
-    MIN_CONFIDENCE
-  ){
-
-    return;
-
-  }
+    const live =
+      state.assets[
+        trade.symbol
+      ]?.M5;
 
 
-  const slot =
-    `${signal.symbol}:${signal.timeframe}`;
+    const currentPrice =
+      Number(
+        live?.price
+        ??
+        live?.currentPrice
+      );
 
 
-  const fingerprint =
-    `${signal.side}|${signal.candleTime}`;
-
-
-  const now =
-    Date.now();
-
-
-  const previous =
-    lastPush.get(
-      slot
+    await updateTrade(
+      trade,
+      currentPrice
     );
 
-
-  const cooldownMs =
-    PUSH_COOLDOWN_MIN
-    *
-    60
-    *
-    1000;
-
-
-  if(
-    previous
-    &&
-    previous.fingerprint===
-    fingerprint
-    &&
-    now-
-    previous.time
-    <
-    cooldownMs
-  ){
-
-    return;
-
   }
 
-
-  lastPush.set(
-
-    slot,
-
-    {
-
-      fingerprint,
-
-      time:now
-
-    }
-
-  );
+}
 
 
-  await sendPush(
+async function maybeOpenNewTrades() {
 
-    `BIT ADAMS • ${signal.side} ${signal.symbol} ${signal.timeframe}`,
+  for(
+    const symbol
+    of
+    Object.keys(
+      ASSETS
+    )
+  ) {
 
-    `Confidence ${signal.confidence}% • Entry ${signal.entry} • SL ${signal.sl} • TP1 ${signal.tp1} • TP2 ${signal.tp2} • TP3 ${signal.tp3}`,
+    if(
+      getOpenTrades()
+        .length
+      >=
+      MAX_OPEN_TRADES
+    ) {
 
-    {
-
-      type:"signal",
-
-      symbol:
-        signal.symbol,
-
-      timeframe:
-        signal.timeframe,
-
-      side:
-        signal.side,
-
-      confidence:
-        signal.confidence,
-
-      entry:
-        signal.entry,
-
-      sl:
-        signal.sl,
-
-      tp1:
-        signal.tp1,
-
-      tp2:
-        signal.tp2,
-
-      tp3:
-        signal.tp3
+      break;
 
     }
 
-  );
+
+    if(
+      getOpenTradeForAsset(
+        symbol
+      )
+    ) {
+
+      continue;
+
+    }
+
+
+    const candidate =
+      chooseConfirmedCandidate(
+        symbol
+      );
+
+
+    if(
+      candidate
+    ) {
+
+      await createTradeFromSignal(
+        candidate
+      );
+
+    }
+
+  }
 
 }
 
@@ -1513,23 +2399,25 @@ async function maybeNotify(
    MAIN SCAN
 ========================= */
 
-async function refreshAll(){
+async function refreshAll() {
 
   if(
     state.running
-  ){
+  ) {
 
     return state;
 
   }
 
 
-  state.running=true;
+  state.running =
+    true;
 
-  state.error=null;
+  state.error =
+    null;
 
 
-  try{
+  try {
 
 
     for(
@@ -1541,7 +2429,7 @@ async function refreshAll(){
       Object.entries(
         ASSETS
       )
-    ){
+    ) {
 
 
       for(
@@ -1553,10 +2441,10 @@ async function refreshAll(){
         Object.entries(
           TIMEFRAMES
         )
-      ){
+      ) {
 
 
-        try{
+        try {
 
 
           const candles =
@@ -1586,8 +2474,7 @@ async function refreshAll(){
 
 
         }
-
-        catch(err){
+        catch(err) {
 
 
           console.error(
@@ -1600,7 +2487,7 @@ async function refreshAll(){
             symbol
           ][
             tf
-          ]={
+          ] = {
 
             symbol,
 
@@ -1613,6 +2500,9 @@ async function refreshAll(){
             side:
               "ERROR",
 
+            signal:
+              "ERROR",
+
             direction:
               "ERROR",
 
@@ -1622,7 +2512,7 @@ async function refreshAll(){
             error:
               err.message,
 
-            candles:[]
+            candles: []
 
           };
 
@@ -1651,53 +2541,55 @@ async function refreshAll(){
           m5?.side
         )
         &&
-        m5.side===
+        m5.side ===
         m15?.side
-      ){
+      ) {
 
 
         m5.confidence =
           Math.min(
             99,
-            m5.confidence+4
+            m5.confidence + 4
           );
 
 
         m15.confidence =
           Math.min(
             99,
-            m15.confidence+4
+            m15.confidence + 4
           );
 
       }
 
-
-      await maybeNotify(
-        m5
-      );
-
-
-      await maybeNotify(
-        m15
-      );
-
     }
 
 
+    await updateOpenTrades();
+
+
+    await maybeOpenNewTrades();
+
+
     state.updatedAt =
-      new Date()
-      .toISOString();
+      nowIso();
 
 
     console.log(
+
       "BIT ADAMS scan OK",
-      state.updatedAt
+
+      state.updatedAt,
+
+      "open trades:",
+
+      getOpenTrades()
+        .length
+
     );
 
 
   }
-
-  catch(err){
+  catch(err) {
 
 
     state.error =
@@ -1711,11 +2603,10 @@ async function refreshAll(){
 
 
   }
+  finally {
 
-  finally{
 
-
-    state.running=
+    state.running =
       false;
 
 
@@ -1728,16 +2619,313 @@ async function refreshAll(){
 
 
 /* =========================
+   PUBLIC FRONT-END DATA
+========================= */
+
+function publicSignal(
+  signal
+) {
+
+  if(
+    !signal
+  ) {
+
+    return null;
+
+  }
+
+
+  return {
+
+    ...signal,
+
+    signal:
+      signal.side,
+
+    direction:
+      signal.side,
+
+    currentPrice:
+      signal.price,
+
+    levels: {
+
+      entry:
+        signal.entry,
+
+      sl:
+        signal.sl,
+
+      stopLoss:
+        signal.sl,
+
+      tp1:
+        signal.tp1,
+
+      tp2:
+        signal.tp2,
+
+      tp3:
+        signal.tp3
+
+    }
+
+  };
+
+}
+
+
+function publicAsset(
+  symbol
+) {
+
+  const m5 =
+    publicSignal(
+      state.assets[
+        symbol
+      ].M5
+    );
+
+
+  const m15 =
+    publicSignal(
+      state.assets[
+        symbol
+      ].M15
+    );
+
+
+  const active =
+    getOpenTradeForAsset(
+      symbol
+    );
+
+
+  const candidate =
+    chooseConfirmedCandidate(
+      symbol
+    );
+
+
+  const summary =
+    candidate
+    ||
+    m15
+    ||
+    m5;
+
+
+  return {
+
+    symbol,
+
+    asset:
+      symbol,
+
+    M5:
+      m5,
+
+    M15:
+      m15,
+
+    m5,
+
+    m15,
+
+    timeframes: {
+
+      M5:
+        m5,
+
+      M15:
+        m15
+
+    },
+
+    signal:
+      summary?.side
+      ||
+      summary?.signal
+      ||
+      "WAIT",
+
+    direction:
+      summary?.side
+      ||
+      summary?.direction
+      ||
+      "WAIT",
+
+    confidence:
+      Number(
+        summary?.confidence || 0
+      ),
+
+    price:
+      Number(
+        m5?.price
+        ??
+        m15?.price
+        ??
+        0
+      )
+      ||
+      null,
+
+    currentPrice:
+      Number(
+        m5?.price
+        ??
+        m15?.price
+        ??
+        0
+      )
+      ||
+      null,
+
+    levels:
+
+      active
+
+        ?
+
+        {
+
+          entry:
+            active.entry,
+
+          sl:
+            active.sl,
+
+          stopLoss:
+            active.sl,
+
+          tp1:
+            active.tp1,
+
+          tp2:
+            active.tp2,
+
+          tp3:
+            active.tp3,
+
+          status:
+            active.status
+
+        }
+
+        :
+
+        {
+
+          entry:
+            summary?.entry
+            ??
+            null,
+
+          sl:
+            summary?.sl
+            ??
+            null,
+
+          stopLoss:
+            summary?.sl
+            ??
+            null,
+
+          tp1:
+            summary?.tp1
+            ??
+            null,
+
+          tp2:
+            summary?.tp2
+            ??
+            null,
+
+          tp3:
+            summary?.tp3
+            ??
+            null,
+
+          status:
+
+            summary?.side
+            &&
+            summary.side !== "WAIT"
+
+              ?
+
+              "READY"
+
+              :
+
+              "WAIT"
+
+        },
+
+    status:
+      active?.status
+      ||
+      "WAIT"
+
+  };
+
+}
+
+
+function getPublicState() {
+
+  return {
+
+    ok:
+      true,
+
+    updatedAt:
+      state.updatedAt,
+
+    running:
+      state.running,
+
+    error:
+      state.error,
+
+    assets: {
+
+      XAUUSD:
+        publicAsset(
+          "XAUUSD"
+        ),
+
+      BTCUSD:
+        publicAsset(
+          "BTCUSD"
+        )
+
+    },
+
+    openTrades:
+      getOpenTrades(),
+
+    history:
+      tradeHistory
+
+  };
+
+}
+
+
+/* =========================
    NORMALIZE
 ========================= */
 
 function normalizeSymbol(
   value
-){
+) {
 
   const v =
     String(
-      value||""
+      value || ""
     )
     .toUpperCase()
     .replace(
@@ -1747,10 +2935,10 @@ function normalizeSymbol(
 
 
   if(
-    v==="XAUUSD"
+    v === "XAUUSD"
     ||
-    v==="GOLD"
-  ){
+    v === "GOLD"
+  ) {
 
     return "XAUUSD";
 
@@ -1758,12 +2946,12 @@ function normalizeSymbol(
 
 
   if(
-    v==="BTCUSD"
+    v === "BTCUSD"
     ||
-    v==="BITCOIN"
+    v === "BITCOIN"
     ||
-    v==="BTC"
-  ){
+    v === "BTC"
+  ) {
 
     return "BTCUSD";
 
@@ -1777,22 +2965,22 @@ function normalizeSymbol(
 
 function normalizeTimeframe(
   value
-){
+) {
 
   const v =
     String(
-      value||""
+      value || ""
     )
     .toUpperCase();
 
 
   if(
-    v==="M5"
+    v === "M5"
     ||
-    v==="5MIN"
+    v === "5MIN"
     ||
-    v==="5"
-  ){
+    v === "5"
+  ) {
 
     return "M5";
 
@@ -1800,12 +2988,12 @@ function normalizeTimeframe(
 
 
   if(
-    v==="M15"
+    v === "M15"
     ||
-    v==="15MIN"
+    v === "15MIN"
     ||
-    v==="15"
-  ){
+    v === "15"
+  ) {
 
     return "M15";
 
@@ -1817,28 +3005,29 @@ function normalizeTimeframe(
 }
 
 
-async function ensureFresh(){
+async function ensureFresh() {
 
   const age =
+
     state.updatedAt
 
-    ?
+      ?
 
-    Date.now()
-    -
-    new Date(
-      state.updatedAt
-    )
-    .getTime()
+      Date.now()
+      -
+      new Date(
+        state.updatedAt
+      )
+      .getTime()
 
-    :
+      :
 
-    Infinity;
+      Infinity;
 
 
   if(
-    age>45000
-  ){
+    age > 45000
+  ) {
 
     await refreshAll();
 
@@ -1853,24 +3042,28 @@ async function ensureFresh(){
 
 app.get(
   "/",
-  (req,res)=>{
+  (req,res) => {
 
     res.json({
 
-      ok:true,
+      ok:
+        true,
 
       name:
-        "BIT ADAMS SERVER",
+        "BIT ADAMS SERVER V8.4",
 
-      assets:[
+      assets: [
         "XAUUSD",
         "BTCUSD"
       ],
 
-      timeframes:[
+      timeframes: [
         "M5",
         "M15"
       ],
+
+      maxOpenTrades:
+        MAX_OPEN_TRADES,
 
       updatedAt:
         state.updatedAt
@@ -1883,11 +3076,12 @@ app.get(
 
 app.get(
   "/health",
-  (req,res)=>{
+  (req,res) => {
 
     res.json({
 
-      ok:true,
+      ok:
+        true,
 
       server:
         "bit-adams-server",
@@ -1904,6 +3098,13 @@ app.get(
           ONESIGNAL_API_KEY
         ),
 
+      openTrades:
+        getOpenTrades()
+        .length,
+
+      totalTrackedTrades:
+        tradeHistory.length,
+
       updatedAt:
         state.updatedAt,
 
@@ -1918,12 +3119,12 @@ app.get(
 
 app.get(
   "/api/market",
-  async(req,res)=>{
+  async(req,res) => {
 
     await ensureFresh();
 
     res.json(
-      state
+      getPublicState()
     );
 
   }
@@ -1932,12 +3133,12 @@ app.get(
 
 app.get(
   "/api/scan",
-  async(req,res)=>{
+  async(req,res) => {
 
-    await refreshAll();
+    await ensureFresh();
 
     res.json(
-      state
+      getPublicState()
     );
 
   }
@@ -1945,8 +3146,85 @@ app.get(
 
 
 app.get(
+  "/api/history",
+  async(req,res) => {
+
+    await ensureFresh();
+
+
+    const wins =
+      tradeHistory.filter(
+        t =>
+          t.status === "WIN"
+      )
+      .length;
+
+
+    const lost =
+      tradeHistory.filter(
+        t =>
+          t.status === "LOST"
+      )
+      .length;
+
+
+    const closed =
+      wins +
+      lost;
+
+
+    res.json({
+
+      ok:
+        true,
+
+      open:
+        getOpenTrades()
+        .length,
+
+      total:
+        tradeHistory.length,
+
+      wins,
+
+      lost,
+
+      breakEven:
+        tradeHistory.filter(
+          t =>
+            t.status ===
+            "BREAK-EVEN"
+        )
+        .length,
+
+      winRate:
+
+        closed
+
+          ?
+
+          Math.round(
+            wins /
+            closed *
+            100
+          )
+
+          :
+
+          0,
+
+      trades:
+        tradeHistory
+
+    });
+
+  }
+);
+
+
+app.get(
   "/api/analyze",
-  async(req,res)=>{
+  async(req,res) => {
 
     const symbol =
       normalizeSymbol(
@@ -1968,18 +3246,19 @@ app.get(
       !symbol
       ||
       !timeframe
-    ){
+    ) {
 
       return res
-      .status(400)
-      .json({
+        .status(400)
+        .json({
 
-        ok:false,
+          ok:
+            false,
 
-        error:
-          "Use symbol=XAUUSD or BTCUSD and timeframe=M5 or M15"
+          error:
+            "Use symbol=XAUUSD or BTCUSD and timeframe=M5 or M15"
 
-      });
+        });
 
     }
 
@@ -1989,13 +3268,16 @@ app.get(
 
     res.json({
 
-      ok:true,
+      ok:
+        true,
 
-      ...state.assets[
-        symbol
-      ][
-        timeframe
-      ]
+      ...publicSignal(
+        state.assets[
+          symbol
+        ][
+          timeframe
+        ]
+      )
 
     });
 
@@ -2009,7 +3291,7 @@ app.get(
 
 app.get(
   "/api/candles",
-  async(req,res)=>{
+  async(req,res) => {
 
     const symbol =
       normalizeSymbol(
@@ -2031,18 +3313,19 @@ app.get(
       !symbol
       ||
       !timeframe
-    ){
+    ) {
 
       return res
-      .status(400)
-      .json({
+        .status(400)
+        .json({
 
-        ok:false,
+          ok:
+            false,
 
-        error:
-          "Use symbol=XAUUSD or BTCUSD and timeframe=M5 or M15"
+          error:
+            "Use symbol=XAUUSD or BTCUSD and timeframe=M5 or M15"
 
-      });
+        });
 
     }
 
@@ -2060,7 +3343,8 @@ app.get(
 
     res.json({
 
-      ok:true,
+      ok:
+        true,
 
       symbol,
 
@@ -2075,13 +3359,13 @@ app.get(
           signal?.candles
         )
 
-        ?
+          ?
 
-        signal.candles
+          signal.candles
 
-        :
+          :
 
-        []
+          []
 
     });
 
@@ -2095,7 +3379,7 @@ app.get(
 
 app.post(
   "/api/test-notification",
-  async(req,res)=>{
+  async(req,res) => {
 
     const result =
       await sendPush(
@@ -2105,7 +3389,8 @@ app.post(
         "Notifications from the BIT ADAMS server are working.",
 
         {
-          type:"test"
+          type:
+            "test"
         }
 
       );
@@ -2129,11 +3414,11 @@ app.listen(
 
   "0.0.0.0",
 
-  ()=>{
+  () => {
 
 
     console.log(
-      `BIT ADAMS SERVER running on port ${PORT}`
+      `BIT ADAMS SERVER V8.4 running on port ${PORT}`
     );
 
 
@@ -2143,19 +3428,19 @@ app.listen(
 
 
     refreshAll()
-    .catch(
-      console.error
-    );
+      .catch(
+        console.error
+      );
 
 
     setInterval(
 
-      ()=>{
+      () => {
 
         refreshAll()
-        .catch(
-          console.error
-        );
+          .catch(
+            console.error
+          );
 
       },
 
