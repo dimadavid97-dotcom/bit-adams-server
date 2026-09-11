@@ -5,10 +5,12 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT =
+  Number(process.env.PORT || 10000);
 
 const TWELVE_DATA_API_KEY =
   process.env.TWELVE_DATA_API_KEY || "";
@@ -19,10 +21,11 @@ const ONESIGNAL_APP_ID =
 const ONESIGNAL_API_KEY =
   process.env.ONESIGNAL_API_KEY || "";
 
-const SCAN_SECONDS = Math.max(
-  60,
-  Number(process.env.SCAN_SECONDS || 60)
-);
+const SCAN_SECONDS =
+  Math.max(
+    60,
+    Number(process.env.SCAN_SECONDS || 60)
+  );
 
 const MIN_CONFIDENCE =
   Number(process.env.MIN_CONFIDENCE || 78);
@@ -31,43 +34,56 @@ const PUSH_COOLDOWN_MIN =
   Number(process.env.PUSH_COOLDOWN_MIN || 15);
 
 
+/* =========================
+   ASSETS
+========================= */
+
 const ASSETS = {
-  XAUUSD: {
-    api: "XAU/USD",
-    label: "GOLD"
+
+  XAUUSD:{
+    api:"XAU/USD",
+    label:"GOLD"
   },
 
-  BTCUSD: {
-    api: "BTC/USD",
-    label: "BITCOIN"
+  BTCUSD:{
+    api:"BTC/USD",
+    label:"BITCOIN"
   }
+
 };
 
 
 const TIMEFRAMES = {
-  M5: "5min",
-  M15: "15min"
+
+  M5:"5min",
+
+  M15:"15min"
+
 };
 
 
+/* =========================
+   STATE
+========================= */
+
 const state = {
 
-  updatedAt: null,
+  updatedAt:null,
 
-  running: false,
+  running:false,
 
-  error: null,
+  error:null,
 
-  assets: {
+  assets:{
 
-    XAUUSD: {
-      M5: null,
-      M15: null
+    XAUUSD:{
+      M5:null,
+      M15:null
     },
 
-    BTCUSD: {
-      M5: null,
-      M15: null
+    BTCUSD:{
+      M5:null,
+      M15:null
     }
 
   }
@@ -75,107 +91,201 @@ const state = {
 };
 
 
-const lastPush = new Map();
+const candleCache =
+  new Map();
+
+const lastPush =
+  new Map();
+
+let apiRequestTimes = [];
+
+let apiGate =
+  Promise.resolve();
 
 
-function roundPrice(symbol, value) {
+function sleep(ms){
 
-  if (value === null || value === undefined) {
-    return null;
-  }
-
-  return Number(
-    Number(value).toFixed(2)
+  return new Promise(
+    resolve=>
+    setTimeout(resolve,ms)
   );
 
 }
 
 
-function ema(values, period) {
+/* =========================
+   API CREDIT GUARD
+   MAX 8 / MINUTE
+========================= */
 
-  if (
-    !Array.isArray(values) ||
-    values.length < period
-  ) {
-    return null;
-  }
+async function reserveApiCredit(){
 
-  const k = 2 / (period + 1);
+  const run =
+  apiGate.then(async()=>{
 
-  let result =
-    values
-      .slice(0, period)
-      .reduce((a, b) => a + b, 0)
-    / period;
+    while(true){
 
-  for (
-    let i = period;
-    i < values.length;
-    i++
-  ) {
+      const now =
+        Date.now();
 
-    result =
-      values[i] * k +
-      result * (1 - k);
+      apiRequestTimes =
+      apiRequestTimes.filter(
+        t=>
+        now-t<60000
+      );
 
-  }
+      if(
+        apiRequestTimes.length<8
+      ){
 
-  return result;
+        apiRequestTimes.push(
+          Date.now()
+        );
+
+        return;
+
+      }
+
+      const wait =
+        Math.max(
+          500,
+          60000-
+          (
+            now-
+            apiRequestTimes[0]
+          )
+          +400
+        );
+
+      await sleep(wait);
+
+    }
+
+  });
+
+
+  apiGate =
+    run.catch(()=>{});
+
+  return run;
 
 }
 
 
-function rsi(values, period = 14) {
+/* =========================
+   INDICATORS
+========================= */
 
-  if (
-    !Array.isArray(values) ||
-    values.length <= period
-  ) {
+function roundPrice(value){
+
+  if(
+    !Number.isFinite(
+      Number(value)
+    )
+  ){
     return null;
   }
 
-  let gains = 0;
-  let losses = 0;
+  return Number(
+    Number(value)
+    .toFixed(2)
+  );
 
-  for (
-    let i = values.length - period;
-    i < values.length;
+}
+
+
+function emaSeries(
+  values,
+  period
+){
+
+  if(!values.length)
+    return[];
+
+  const k =
+    2/(period+1);
+
+  const out =
+    [values[0]];
+
+  for(
+    let i=1;
+    i<values.length;
     i++
-  ) {
+  ){
+
+    out.push(
+
+      values[i]*k
+      +
+      out[i-1]*(1-k)
+
+    );
+
+  }
+
+  return out;
+
+}
+
+
+function rsi(
+  values,
+  period=14
+){
+
+  if(
+    !Array.isArray(values)
+    ||
+    values.length<=period
+  ){
+    return 50;
+  }
+
+  let gains=0;
+  let losses=0;
+
+  for(
+    let i=
+    values.length-period;
+    i<values.length;
+    i++
+  ){
 
     const change =
-      values[i] -
-      values[i - 1];
+      values[i]-
+      values[i-1];
 
-    if (change >= 0) {
+    if(change>=0){
 
-      gains += change;
+      gains+=change;
 
-    } else {
+    }
 
-      losses +=
-        Math.abs(change);
+    else{
+
+      losses+=
+      Math.abs(change);
 
     }
 
   }
 
   const avgGain =
-    gains / period;
+    gains/period;
 
   const avgLoss =
-    losses / period;
+    losses/period;
 
-  if (avgLoss === 0) {
+  if(avgLoss===0)
     return 100;
-  }
 
   const rs =
-    avgGain / avgLoss;
+    avgGain/avgLoss;
 
-  return (
-    100 -
-    100 / (1 + rs)
+  return(
+    100-
+    100/(1+rs)
   );
 
 }
@@ -183,76 +293,217 @@ function rsi(values, period = 14) {
 
 function atr(
   candles,
-  period = 14
-) {
+  period=14
+){
 
-  if (
-    !Array.isArray(candles) ||
-    candles.length <= period
-  ) {
-
-    return null;
-
+  if(
+    !Array.isArray(candles)
+    ||
+    candles.length<=period
+  ){
+    return 0;
   }
 
-  const trs = [];
+  const trs=[];
 
-  for (
-    let i = candles.length - period;
-    i < candles.length;
+  for(
+    let i=
+    candles.length-period;
+    i<candles.length;
     i++
-  ) {
+  ){
 
     const current =
       candles[i];
 
     const previous =
-      candles[i - 1];
+      candles[i-1];
 
-    const tr =
+    trs.push(
+
       Math.max(
 
-        current.high -
+        current.high-
         current.low,
 
         Math.abs(
-          current.high -
+          current.high-
           previous.close
         ),
 
         Math.abs(
-          current.low -
+          current.low-
           previous.close
         )
 
-      );
+      )
 
-    trs.push(tr);
+    );
 
   }
 
-  return (
+  return(
     trs.reduce(
-      (a, b) => a + b,
+      (a,b)=>a+b,
       0
-    ) / trs.length
+    )
+    /
+    trs.length
   );
 
 }
 
 
+function slope(
+  values,
+  lookback=5
+){
+
+  if(
+    !Array.isArray(values)
+    ||
+    values.length<
+    lookback+1
+  ){
+    return 0;
+  }
+
+  const a =
+    values.at(-1);
+
+  const b =
+    values[
+      values.length-
+      1-
+      lookback
+    ];
+
+  return(
+    (
+      a-b
+    )
+    /
+    Math.max(
+      Math.abs(b),
+      1
+    )
+    *
+    100
+  );
+
+}
+
+
+function macd(values){
+
+  if(
+    values.length<35
+  ){
+
+    return{
+      line:0,
+      signal:0,
+      hist:0
+    };
+
+  }
+
+  const e12 =
+    emaSeries(
+      values,
+      12
+    );
+
+  const e26 =
+    emaSeries(
+      values,
+      26
+    );
+
+  const lineSeries =
+    values.map(
+      (_,i)=>
+      e12[i]-e26[i]
+    );
+
+  const signalSeries =
+    emaSeries(
+      lineSeries,
+      9
+    );
+
+  return{
+
+    line:
+      lineSeries.at(-1),
+
+    signal:
+      signalSeries.at(-1),
+
+    hist:
+      lineSeries.at(-1)
+      -
+      signalSeries.at(-1)
+
+  };
+
+}
+
+
+/* =========================
+   TWELVE DATA
+========================= */
+
 async function fetchCandles(
   apiSymbol,
-  interval
-) {
+  interval,
+  outputsize=80,
+  force=false
+){
 
-  if (!TWELVE_DATA_API_KEY) {
+  if(
+    !TWELVE_DATA_API_KEY
+  ){
 
     throw new Error(
       "TWELVE_DATA_API_KEY is missing"
     );
 
   }
+
+
+  const cacheKey =
+    `${apiSymbol}|${interval}`;
+
+
+  const cached =
+    candleCache.get(
+      cacheKey
+    );
+
+
+  if(
+    !force
+    &&
+    cached
+    &&
+    Date.now()-
+    cached.time
+    <
+    45000
+  ){
+
+    return(
+      cached.candles
+      .slice(
+        -outputsize
+      )
+    );
+
+  }
+
+
+  await reserveApiCredit();
 
 
   const url =
@@ -273,7 +524,12 @@ async function fetchCandles(
 
   url.searchParams.set(
     "outputsize",
-    "80"
+    String(
+      Math.max(
+        80,
+        outputsize
+      )
+    )
   );
 
   url.searchParams.set(
@@ -283,86 +539,123 @@ async function fetchCandles(
 
 
   const response =
-    await fetch(url, {
-
-      headers: {
-        Accept: "application/json"
+    await fetch(
+      url,
+      {
+        headers:{
+          Accept:
+          "application/json"
+        }
       }
-
-    });
-
-
-  if (!response.ok) {
-
-    throw new Error(
-      `Twelve Data HTTP ${response.status}`
     );
-
-  }
 
 
   const data =
-    await response.json();
+    await response
+    .json()
+    .catch(
+      ()=>({})
+    );
 
 
-  if (
-    data.status === "error" ||
-    !Array.isArray(data.values)
-  ) {
+  if(
+    !response.ok
+    ||
+    data.status==="error"
+    ||
+    !Array.isArray(
+      data.values
+    )
+  ){
 
     throw new Error(
-      data.message ||
-      "Twelve Data returned no candles"
+
+      data.message
+      ||
+      data.code
+      ||
+      `Twelve Data HTTP ${response.status}`
+
     );
 
   }
 
 
-  return data.values
+  const candles =
+    data.values
 
-    .map(v => ({
+    .map(
+      v=>({
 
-      datetime:
-        v.datetime,
+        datetime:
+          v.datetime,
 
-      open:
-        Number(v.open),
+        open:
+          Number(v.open),
 
-      high:
-        Number(v.high),
+        high:
+          Number(v.high),
 
-      low:
-        Number(v.low),
+        low:
+          Number(v.low),
 
-      close:
-        Number(v.close)
+        close:
+          Number(v.close)
 
-    }))
+      })
+    )
 
-    .filter(c =>
+    .filter(
+      c=>
       [
         c.open,
         c.high,
         c.low,
         c.close
-      ].every(Number.isFinite)
+      ]
+      .every(
+        Number.isFinite
+      )
     )
 
     .reverse();
 
+
+  candleCache.set(
+    cacheKey,
+    {
+      time:
+        Date.now(),
+
+      candles
+    }
+  );
+
+
+  return(
+    candles.slice(
+      -outputsize
+    )
+  );
+
 }
 
+
+/* =========================
+   FAST SIGNAL ENGINE
+========================= */
 
 function analyze(
   symbol,
   timeframe,
   candles
-) {
+){
 
-
-  if (
-    candles.length < 30
-  ) {
+  if(
+    !Array.isArray(candles)
+    ||
+    candles.length<50
+  ){
 
     throw new Error(
       "Not enough candles"
@@ -373,38 +666,44 @@ function analyze(
 
   const closes =
     candles.map(
-      c => c.close
+      c=>c.close
     );
 
 
   const latest =
-    candles[
-      candles.length - 1
-    ];
-
+    candles.at(-1);
 
   const previous =
-    candles[
-      candles.length - 2
-    ];
+    candles.at(-2);
 
 
-  const price =
-    latest.close;
-
-
-  const ema9 =
-    ema(
+  const e9 =
+    emaSeries(
       closes,
       9
     );
 
-
-  const ema21 =
-    ema(
+  const e21 =
+    emaSeries(
       closes,
       21
     );
+
+  const e50 =
+    emaSeries(
+      closes,
+      50
+    );
+
+
+  const fast =
+    e9.at(-1);
+
+  const slow =
+    e21.at(-1);
+
+  const long =
+    e50.at(-1);
 
 
   const rsi14 =
@@ -421,254 +720,507 @@ function analyze(
     );
 
 
-  const momentumBase =
-    closes[
-      Math.max(
-        0,
-        closes.length - 4
-      )
-    ];
-
-
   const momentum =
-    (
-      (
-        price -
-        momentumBase
-      )
-      /
-      momentumBase
+    slope(
+      closes,
+      6
+    );
+
+
+  const trendSlope =
+    slope(
+      e21,
+      5
+    );
+
+
+  const M =
+    macd(
+      closes
+    );
+
+
+  const body =
+    Math.abs(
+      latest.close-
+      latest.open
+    );
+
+
+  const range =
+    Math.max(
+      latest.high-
+      latest.low,
+      1e-9
+    );
+
+
+  const bodyRatio =
+    body/range;
+
+
+  const atrPct =
+    atr14
+    /
+    Math.max(
+      latest.close,
+      1
     )
-    * 100;
+    *
+    100;
 
 
-  let direction =
-    "WAIT";
+  let buy=0;
+
+  let sell=0;
 
 
-  if (
-    ema9 > ema21 &&
-    rsi14 >= 50 &&
-    momentum > 0
-  ) {
+  if(fast>slow)
+    buy+=18;
+  else
+    sell+=18;
 
-    direction =
-      "BUY";
+
+  if(slow>long)
+    buy+=15;
+  else
+    sell+=15;
+
+
+  if(latest.close>fast)
+    buy+=9;
+  else
+    sell+=9;
+
+
+  if(latest.close>slow)
+    buy+=7;
+  else
+    sell+=7;
+
+
+  if(
+    trendSlope>0.010
+  ){
+
+    buy+=10;
+
+  }
+
+  else if(
+    trendSlope<-0.010
+  ){
+
+    sell+=10;
 
   }
 
 
-  if (
-    ema9 < ema21 &&
-    rsi14 <= 50 &&
-    momentum < 0
-  ) {
+  if(
+    rsi14>=52
+    &&
+    rsi14<=70
+  ){
 
-    direction =
-      "SELL";
+    buy+=13;
+
+  }
+
+  else if(
+    rsi14<=48
+    &&
+    rsi14>=30
+  ){
+
+    sell+=13;
+
+  }
+
+  else if(
+    rsi14>72
+  ){
+
+    sell+=3;
+
+  }
+
+  else if(
+    rsi14<28
+  ){
+
+    buy+=3;
 
   }
 
 
-  const trendStrength =
-    atr14 > 0
+  if(
+    momentum>0.015
+  ){
 
-      ? Math.abs(
-          ema9 - ema21
-        ) / atr14
+    buy+=10;
 
-      : 0;
+  }
 
+  else if(
+    momentum<-0.015
+  ){
 
-  let confidence = 0;
+    sell+=10;
 
-
-  if (
-    direction !== "WAIT"
-  ) {
-
-
-    confidence = 58;
+  }
 
 
-    confidence +=
-      Math.min(
-        18,
-        trendStrength * 16
-      );
+  if(
+    M.hist>0
+    &&
+    M.line>M.signal
+  ){
+
+    buy+=10;
+
+  }
+
+  else if(
+    M.hist<0
+    &&
+    M.line<M.signal
+  ){
+
+    sell+=10;
+
+  }
 
 
-    confidence +=
-      Math.min(
-        10,
-        Math.abs(
-          rsi14 - 50
-        ) * 0.75
-      );
+  if(
+    latest.close>
+    latest.open
+  ){
+
+    buy+=4;
+
+  }
 
 
-    confidence +=
-      Math.min(
-        8,
-        Math.abs(
-          momentum
-        ) * 8
-      );
+  if(
+    latest.close<
+    latest.open
+  ){
+
+    sell+=4;
+
+  }
 
 
-    const candleAgrees =
+  if(
+    latest.close>
+    latest.open
+    &&
+    previous.close>
+    previous.open
+  ){
 
-      (
-        direction === "BUY" &&
-        latest.close >= latest.open &&
-        latest.close >= previous.close
-      )
+    buy+=4;
 
-      ||
-
-      (
-        direction === "SELL" &&
-        latest.close <= latest.open &&
-        latest.close <= previous.close
-      );
+  }
 
 
-    if (candleAgrees) {
+  if(
+    latest.close<
+    latest.open
+    &&
+    previous.close<
+    previous.open
+  ){
 
-      confidence += 4;
+    sell+=4;
+
+  }
+
+
+  if(
+    bodyRatio>0.50
+  ){
+
+    if(
+      latest.close>
+      latest.open
+    ){
+
+      buy+=5;
 
     }
 
+    else{
 
-    confidence =
-      Math.max(
-        60,
-        Math.min(
-          97,
-          Math.round(
-            confidence
-          )
-        )
-      );
+      sell+=5;
+
+    }
 
   }
+
+
+  const dominant =
+    Math.max(
+      buy,
+      sell
+    );
+
+
+  const difference =
+    Math.abs(
+      buy-sell
+    );
+
+
+  const buyTrend =
+
+    fast>slow
+    &&
+    latest.close>slow
+    &&
+    trendSlope>=0;
+
+
+  const sellTrend =
+
+    fast<slow
+    &&
+    latest.close<slow
+    &&
+    trendSlope<=0;
+
+
+  const volatilityOK =
+
+    atrPct>=(
+      symbol==="BTCUSD"
+      ? 0.06
+      : 0.018
+    );
+
+
+  let side =
+    "WAIT";
+
+
+  if(
+    volatilityOK
+    &&
+    buy>=60
+    &&
+    difference>=10
+    &&
+    buyTrend
+    &&
+    rsi14<74
+    &&
+    momentum>-0.015
+  ){
+
+    side="BUY";
+
+  }
+
+
+  if(
+    volatilityOK
+    &&
+    sell>=60
+    &&
+    difference>=10
+    &&
+    sellTrend
+    &&
+    rsi14>26
+    &&
+    momentum<0.015
+  ){
+
+    side="SELL";
+
+  }
+
+
+  const confidence =
+
+    side==="WAIT"
+
+    ?
+
+    Math.round(
+
+      Math.min(
+        72,
+        45+
+        dominant*0.25
+      )
+
+    )
+
+    :
+
+    Math.round(
+
+      Math.max(
+        72,
+
+        Math.min(
+          96,
+
+          58
+          +
+          dominant*0.34
+          +
+          difference*0.10
+        )
+
+      )
+
+    );
+
+
+  const entry =
+    latest.close;
+
+
+  const atrFloor =
+
+    entry*(
+
+      symbol==="BTCUSD"
+
+      ? 0.0011
+
+      : 0.0008
+
+    );
 
 
   const risk =
-    atr14 ||
-    price * 0.002;
+    Math.max(
+      atr14*1.10,
+      atrFloor
+    );
 
 
-  let sl = null;
-  let tp1 = null;
-  let tp2 = null;
-  let tp3 = null;
+  let sl=null;
+
+  let tp1=null;
+
+  let tp2=null;
+
+  let tp3=null;
 
 
-  if (
-    direction === "BUY"
-  ) {
+  if(
+    side==="BUY"
+  ){
 
-    sl =
-      price -
-      risk * 1.15;
+    sl=
+      entry-risk;
 
-    tp1 =
-      price +
-      risk * 0.80;
+    tp1=
+      entry+
+      risk*0.85;
 
-    tp2 =
-      price +
-      risk * 1.40;
+    tp2=
+      entry+
+      risk*1.45;
 
-    tp3 =
-      price +
-      risk * 2.00;
-
-  }
-
-
-  if (
-    direction === "SELL"
-  ) {
-
-    sl =
-      price +
-      risk * 1.15;
-
-    tp1 =
-      price -
-      risk * 0.80;
-
-    tp2 =
-      price -
-      risk * 1.40;
-
-    tp3 =
-      price -
-      risk * 2.00;
+    tp3=
+      entry+
+      risk*2.20;
 
   }
 
 
-  return {
+  if(
+    side==="SELL"
+  ){
+
+    sl=
+      entry+risk;
+
+    tp1=
+      entry-
+      risk*0.85;
+
+    tp2=
+      entry-
+      risk*1.45;
+
+    tp3=
+      entry-
+      risk*2.20;
+
+  }
+
+
+  const quality =
+
+    side==="WAIT"
+
+    ? "WAIT"
+
+    : confidence>=90
+
+    ? "EXCELLENT"
+
+    : confidence>=82
+
+    ? "STRONG"
+
+    : "VALID";
+
+
+  return{
 
     symbol,
 
+    asset:
+      symbol,
+
     timeframe,
 
-    direction,
+    side,
+
+    direction:
+      side,
 
     confidence,
 
+    quality,
+
     price:
       roundPrice(
-        symbol,
-        price
+        entry
       ),
 
     entry:
-      direction === "WAIT"
-        ? null
-        : roundPrice(
-            symbol,
-            price
-          ),
+      side==="WAIT"
+      ? null
+      : roundPrice(
+          entry
+        ),
 
     sl:
       roundPrice(
-        symbol,
         sl
       ),
 
     tp1:
       roundPrice(
-        symbol,
         tp1
       ),
 
     tp2:
       roundPrice(
-        symbol,
         tp2
       ),
 
     tp3:
       roundPrice(
-        symbol,
         tp3
-      ),
-
-    ema9:
-      roundPrice(
-        symbol,
-        ema9
-      ),
-
-    ema21:
-      roundPrice(
-        symbol,
-        ema21
       ),
 
     rsi14:
@@ -676,9 +1228,13 @@ function analyze(
         rsi14.toFixed(1)
       ),
 
+    rsi:
+      Number(
+        rsi14.toFixed(1)
+      ),
+
     atr14:
       roundPrice(
-        symbol,
         atr14
       ),
 
@@ -687,32 +1243,45 @@ function analyze(
         momentum.toFixed(3)
       ),
 
+    buyScore:
+      buy,
+
+    sellScore:
+      sell,
+
     candleTime:
-      latest.datetime
+      latest.datetime,
+
+    candles:
+      candles.slice(-80)
 
   };
 
 }
 
 
+/* =========================
+   ONESIGNAL
+========================= */
+
 async function sendPush(
   title,
   message,
-  data = {}
-) {
+  data={}
+){
 
-
-  if (
-    !ONESIGNAL_APP_ID ||
+  if(
+    !ONESIGNAL_APP_ID
+    ||
     !ONESIGNAL_API_KEY
-  ) {
+  ){
 
     console.log(
       "OneSignal skipped - keys missing"
     );
 
-    return {
-      skipped: true
+    return{
+      skipped:true
     };
 
   }
@@ -725,9 +1294,9 @@ async function sendPush(
 
       {
 
-        method: "POST",
+        method:"POST",
 
-        headers: {
+        headers:{
 
           "Content-Type":
             "application/json",
@@ -736,7 +1305,6 @@ async function sendPush(
             `Key ${ONESIGNAL_API_KEY}`
 
         },
-
 
         body:
           JSON.stringify({
@@ -747,16 +1315,17 @@ async function sendPush(
             target_channel:
               "push",
 
-            included_segments: [
-              "Subscribed Users"
-            ],
+            included_segments:
+              [
+                "Subscribed Users"
+              ],
 
-            headings: {
-              en: title
+            headings:{
+              en:title
             },
 
-            contents: {
-              en: message
+            contents:{
+              en:message
             },
 
             data
@@ -770,20 +1339,24 @@ async function sendPush(
 
   const body =
     await response
-      .json()
-      .catch(() => ({}));
+    .json()
+    .catch(
+      ()=>({})
+    );
 
 
-  if (!response.ok) {
+  if(
+    !response.ok
+  ){
 
     console.error(
       "OneSignal error:",
       body
     );
 
-    return {
+    return{
 
-      ok: false,
+      ok:false,
 
       status:
         response.status,
@@ -801,9 +1374,9 @@ async function sendPush(
   );
 
 
-  return {
+  return{
 
-    ok: true,
+    ok:true,
 
     body
 
@@ -812,16 +1385,22 @@ async function sendPush(
 }
 
 
+/* =========================
+   SIGNAL NOTIFICATION
+========================= */
+
 async function maybeNotify(
   signal
-) {
+){
 
-
-  if (
-    signal.direction === "WAIT" ||
-    signal.confidence <
-      MIN_CONFIDENCE
-  ) {
+  if(
+    !signal
+    ||
+    signal.side==="WAIT"
+    ||
+    signal.confidence<
+    MIN_CONFIDENCE
+  ){
 
     return;
 
@@ -832,32 +1411,39 @@ async function maybeNotify(
     `${signal.symbol}:${signal.timeframe}`;
 
 
+  const fingerprint =
+    `${signal.side}|${signal.candleTime}`;
+
+
   const now =
     Date.now();
 
 
   const previous =
-    lastPush.get(slot);
+    lastPush.get(
+      slot
+    );
 
 
   const cooldownMs =
-    PUSH_COOLDOWN_MIN *
-    60 *
+    PUSH_COOLDOWN_MIN
+    *
+    60
+    *
     1000;
 
 
-  if (
-
-    previous &&
-
-    previous.direction ===
-      signal.direction &&
-
-    now -
-      previous.time <
-      cooldownMs
-
-  ) {
+  if(
+    previous
+    &&
+    previous.fingerprint===
+    fingerprint
+    &&
+    now-
+    previous.time
+    <
+    cooldownMs
+  ){
 
     return;
 
@@ -870,88 +1456,120 @@ async function maybeNotify(
 
     {
 
-      direction:
-        signal.direction,
+      fingerprint,
 
-      time:
-        now
+      time:now
 
     }
 
   );
 
 
-  const title =
-    `BIT ADAMS • ${signal.direction} ${signal.symbol} ${signal.timeframe}`;
-
-
-  const message =
-    `Confidence ${signal.confidence}% • Entry ${signal.entry} • SL ${signal.sl} • TP1 ${signal.tp1} • TP2 ${signal.tp2} • TP3 ${signal.tp3}`;
-
-
   await sendPush(
 
-    title,
+    `BIT ADAMS • ${signal.side} ${signal.symbol} ${signal.timeframe}`,
 
-    message,
+    `Confidence ${signal.confidence}% • Entry ${signal.entry} • SL ${signal.sl} • TP1 ${signal.tp1} • TP2 ${signal.tp2} • TP3 ${signal.tp3}`,
 
-    signal
+    {
+
+      type:"signal",
+
+      symbol:
+        signal.symbol,
+
+      timeframe:
+        signal.timeframe,
+
+      side:
+        signal.side,
+
+      confidence:
+        signal.confidence,
+
+      entry:
+        signal.entry,
+
+      sl:
+        signal.sl,
+
+      tp1:
+        signal.tp1,
+
+      tp2:
+        signal.tp2,
+
+      tp3:
+        signal.tp3
+
+    }
 
   );
 
 }
 
 
-async function refreshAll() {
+/* =========================
+   MAIN SCAN
+========================= */
 
+async function refreshAll(){
 
-  if (state.running) {
+  if(
+    state.running
+  ){
 
     return state;
 
   }
 
 
-  state.running =
-    true;
+  state.running=true;
+
+  state.error=null;
 
 
-  state.error =
-    null;
+  try{
 
 
-  try {
-
-
-    for (
-      const [
+    for(
+      const[
         symbol,
         asset
       ]
-      of Object.entries(
+      of
+      Object.entries(
         ASSETS
       )
-    ) {
+    ){
 
 
-      for (
-        const [
+      for(
+        const[
           tf,
           interval
         ]
-        of Object.entries(
+        of
+        Object.entries(
           TIMEFRAMES
         )
-      ) {
+      ){
 
 
-        try {
+        try{
 
 
           const candles =
             await fetchCandles(
+
               asset.api,
-              interval
+
+              interval,
+
+              80,
+
+              true
+
             );
 
 
@@ -967,7 +1585,9 @@ async function refreshAll() {
             );
 
 
-        } catch (err) {
+        }
+
+        catch(err){
 
 
           console.error(
@@ -980,18 +1600,29 @@ async function refreshAll() {
             symbol
           ][
             tf
-          ] = {
+          ]={
 
             symbol,
+
+            asset:
+              symbol,
 
             timeframe:
               tf,
 
+            side:
+              "ERROR",
+
             direction:
               "ERROR",
 
+            confidence:
+              0,
+
             error:
-              err.message
+              err.message,
+
+            candles:[]
 
           };
 
@@ -1012,85 +1643,50 @@ async function refreshAll() {
         ].M15;
 
 
-      if (
-
-        m5?.direction &&
-        m15?.direction &&
-
+      if(
         [
           "BUY",
           "SELL"
         ].includes(
-          m5.direction
-        ) &&
-
-        m5.direction ===
-          m15.direction
-
-      ) {
+          m5?.side
+        )
+        &&
+        m5.side===
+        m15?.side
+      ){
 
 
         m5.confidence =
           Math.min(
             99,
-            m5.confidence + 4
+            m5.confidence+4
           );
 
 
         m15.confidence =
           Math.min(
             99,
-            m15.confidence + 4
+            m15.confidence+4
           );
 
       }
 
 
-      if (
-
-        m5?.direction &&
-
-        [
-          "BUY",
-          "SELL"
-        ].includes(
-          m5.direction
-        )
-
-      ) {
-
-        await maybeNotify(
-          m5
-        );
-
-      }
+      await maybeNotify(
+        m5
+      );
 
 
-      if (
-
-        m15?.direction &&
-
-        [
-          "BUY",
-          "SELL"
-        ].includes(
-          m15.direction
-        )
-
-      ) {
-
-        await maybeNotify(
-          m15
-        );
-
-      }
+      await maybeNotify(
+        m15
+      );
 
     }
 
 
     state.updatedAt =
       new Date()
-        .toISOString();
+      .toISOString();
 
 
     console.log(
@@ -1099,7 +1695,9 @@ async function refreshAll() {
     );
 
 
-  } catch (err) {
+  }
+
+  catch(err){
 
 
     state.error =
@@ -1112,11 +1710,14 @@ async function refreshAll() {
     );
 
 
-  } finally {
+  }
+
+  finally{
 
 
-    state.running =
+    state.running=
       false;
+
 
   }
 
@@ -1126,14 +1727,17 @@ async function refreshAll() {
 }
 
 
+/* =========================
+   NORMALIZE
+========================= */
+
 function normalizeSymbol(
   value
-) {
-
+){
 
   const v =
     String(
-      value || ""
+      value||""
     )
     .toUpperCase()
     .replace(
@@ -1142,21 +1746,24 @@ function normalizeSymbol(
     );
 
 
-  if (
-    v === "XAUUSD" ||
-    v === "GOLD"
-  ) {
+  if(
+    v==="XAUUSD"
+    ||
+    v==="GOLD"
+  ){
 
     return "XAUUSD";
 
   }
 
 
-  if (
-    v === "BTCUSD" ||
-    v === "BITCOIN" ||
-    v === "BTC"
-  ) {
+  if(
+    v==="BTCUSD"
+    ||
+    v==="BITCOIN"
+    ||
+    v==="BTC"
+  ){
 
     return "BTCUSD";
 
@@ -1170,32 +1777,35 @@ function normalizeSymbol(
 
 function normalizeTimeframe(
   value
-) {
-
+){
 
   const v =
     String(
-      value || ""
+      value||""
     )
     .toUpperCase();
 
 
-  if (
-    v === "M5" ||
-    v === "5MIN" ||
-    v === "5"
-  ) {
+  if(
+    v==="M5"
+    ||
+    v==="5MIN"
+    ||
+    v==="5"
+  ){
 
     return "M5";
 
   }
 
 
-  if (
-    v === "M15" ||
-    v === "15MIN" ||
-    v === "15"
-  ) {
+  if(
+    v==="M15"
+    ||
+    v==="15MIN"
+    ||
+    v==="15"
+  ){
 
     return "M15";
 
@@ -1207,23 +1817,57 @@ function normalizeTimeframe(
 }
 
 
+async function ensureFresh(){
+
+  const age =
+    state.updatedAt
+
+    ?
+
+    Date.now()
+    -
+    new Date(
+      state.updatedAt
+    )
+    .getTime()
+
+    :
+
+    Infinity;
+
+
+  if(
+    age>45000
+  ){
+
+    await refreshAll();
+
+  }
+
+}
+
+
+/* =========================
+   ROUTES
+========================= */
+
 app.get(
   "/",
-  (req, res) => {
+  (req,res)=>{
 
     res.json({
 
-      ok: true,
+      ok:true,
 
       name:
         "BIT ADAMS SERVER",
 
-      assets: [
+      assets:[
         "XAUUSD",
         "BTCUSD"
       ],
 
-      timeframes: [
+      timeframes:[
         "M5",
         "M15"
       ],
@@ -1239,11 +1883,11 @@ app.get(
 
 app.get(
   "/health",
-  (req, res) => {
+  (req,res)=>{
 
     res.json({
 
-      ok: true,
+      ok:true,
 
       server:
         "bit-adams-server",
@@ -1255,7 +1899,8 @@ app.get(
 
       oneSignalConfigured:
         Boolean(
-          ONESIGNAL_APP_ID &&
+          ONESIGNAL_APP_ID
+          &&
           ONESIGNAL_API_KEY
         ),
 
@@ -1272,29 +1917,10 @@ app.get(
 
 
 app.get(
-  "/api/scan",
-  async (req, res) => {
+  "/api/market",
+  async(req,res)=>{
 
-
-    const age =
-      state.updatedAt
-
-        ? Date.now() -
-          new Date(
-            state.updatedAt
-          ).getTime()
-
-        : Infinity;
-
-
-    if (
-      age > 45000
-    ) {
-
-      await refreshAll();
-
-    }
-
+    await ensureFresh();
 
     res.json(
       state
@@ -1305,29 +1931,10 @@ app.get(
 
 
 app.get(
-  "/api/market",
-  async (req, res) => {
+  "/api/scan",
+  async(req,res)=>{
 
-
-    const age =
-      state.updatedAt
-
-        ? Date.now() -
-          new Date(
-            state.updatedAt
-          ).getTime()
-
-        : Infinity;
-
-
-    if (
-      age > 45000
-    ) {
-
-      await refreshAll();
-
-    }
-
+    await refreshAll();
 
     res.json(
       state
@@ -1339,8 +1946,7 @@ app.get(
 
 app.get(
   "/api/analyze",
-  async (req, res) => {
-
+  async(req,res)=>{
 
     const symbol =
       normalizeSymbol(
@@ -1350,54 +1956,40 @@ app.get(
 
     const timeframe =
       normalizeTimeframe(
-        req.query.timeframe ||
+
+        req.query.timeframe
+        ||
         req.query.tf
+
       );
 
 
-    if (
-      !symbol ||
+    if(
+      !symbol
+      ||
       !timeframe
-    ) {
-
+    ){
 
       return res
-        .status(400)
-        .json({
+      .status(400)
+      .json({
 
-          ok: false,
+        ok:false,
 
-          error:
-            "Use symbol=XAUUSD or BTCUSD and timeframe=M5 or M15"
+        error:
+          "Use symbol=XAUUSD or BTCUSD and timeframe=M5 or M15"
 
-        });
-
-    }
-
-
-    const age =
-      state.updatedAt
-
-        ? Date.now() -
-          new Date(
-            state.updatedAt
-          ).getTime()
-
-        : Infinity;
-
-
-    if (
-      age > 45000
-    ) {
-
-      await refreshAll();
+      });
 
     }
+
+
+    await ensureFresh();
 
 
     res.json({
 
-      ok: true,
+      ok:true,
 
       ...state.assets[
         symbol
@@ -1411,20 +2003,109 @@ app.get(
 );
 
 
+/* =========================
+   CANDLES FOR CHART
+========================= */
+
+app.get(
+  "/api/candles",
+  async(req,res)=>{
+
+    const symbol =
+      normalizeSymbol(
+        req.query.symbol
+      );
+
+
+    const timeframe =
+      normalizeTimeframe(
+
+        req.query.timeframe
+        ||
+        req.query.tf
+
+      );
+
+
+    if(
+      !symbol
+      ||
+      !timeframe
+    ){
+
+      return res
+      .status(400)
+      .json({
+
+        ok:false,
+
+        error:
+          "Use symbol=XAUUSD or BTCUSD and timeframe=M5 or M15"
+
+      });
+
+    }
+
+
+    await ensureFresh();
+
+
+    const signal =
+      state.assets[
+        symbol
+      ][
+        timeframe
+      ];
+
+
+    res.json({
+
+      ok:true,
+
+      symbol,
+
+      timeframe,
+
+      updatedAt:
+        state.updatedAt,
+
+      candles:
+
+        Array.isArray(
+          signal?.candles
+        )
+
+        ?
+
+        signal.candles
+
+        :
+
+        []
+
+    });
+
+  }
+);
+
+
+/* =========================
+   TEST NOTIFICATION
+========================= */
+
 app.post(
   "/api/test-notification",
-  async (req, res) => {
-
+  async(req,res)=>{
 
     const result =
       await sendPush(
 
         "BIT ADAMS TEST",
 
-        "Notifications from the new BIT ADAMS server are working.",
+        "Notifications from the BIT ADAMS server are working.",
 
         {
-          type: "test"
+          type:"test"
         }
 
       );
@@ -1438,13 +2119,17 @@ app.post(
 );
 
 
+/* =========================
+   START SERVER
+========================= */
+
 app.listen(
 
   PORT,
 
   "0.0.0.0",
 
-  () => {
+  ()=>{
 
 
     console.log(
@@ -1458,23 +2143,24 @@ app.listen(
 
 
     refreshAll()
-      .catch(
-        console.error
-      );
+    .catch(
+      console.error
+    );
 
 
     setInterval(
 
-      () => {
+      ()=>{
 
         refreshAll()
-          .catch(
-            console.error
-          );
+        .catch(
+          console.error
+        );
 
       },
 
-      SCAN_SECONDS *
+      SCAN_SECONDS
+      *
       1000
 
     );
