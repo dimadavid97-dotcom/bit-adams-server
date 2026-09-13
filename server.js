@@ -11,8 +11,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT =
-  Number(process.env.PORT || 10000);
+const PORT = Number(process.env.PORT || 10000);
 
 const TWELVE_DATA_API_KEY =
   process.env.TWELVE_DATA_API_KEY || "";
@@ -23,18 +22,14 @@ const ONESIGNAL_APP_ID =
 const ONESIGNAL_API_KEY =
   process.env.ONESIGNAL_API_KEY || "";
 
-const MIN_CONFIDENCE =
-  Number(process.env.MIN_CONFIDENCE || 68);
+/* FIXAT LA 68 */
+const MIN_CONFIDENCE = 68;
 
 const MAX_OPEN_TRADES = 2;
-
 const MAX_CANDLES = 150;
 
-const HISTORY_FILE =
-  "./history.json";
-
-const RUNTIME_FILE =
-  "./runtime-state.json";
+const HISTORY_FILE = "./history.json";
+const RUNTIME_FILE = "./runtime-state.json";
 
 const SIGNAL_COOLDOWN_MS =
   15 * 60 * 1000;
@@ -65,30 +60,19 @@ const ASSETS = {
    MEMORY
 ===================================================== */
 
-const states =
-  new Map();
-
-const signals =
-  new Map();
-
-const openTrades =
-  new Map();
-
-const lastSignalTimes =
-  new Map();
+const states = new Map();
+const signals = new Map();
+const openTrades = new Map();
+const lastSignalTimes = new Map();
 
 let history = [];
 
 let ws = null;
-
 let wsConnected = false;
-
 let wsLastEvent = null;
 
 let reconnectTimer = null;
-
 let reconnectAttempt = 0;
-
 let shuttingDown = false;
 
 
@@ -97,23 +81,14 @@ let shuttingDown = false;
 ===================================================== */
 
 function nowIso() {
-
-  return new Date()
-    .toISOString();
+  return new Date().toISOString();
 }
 
+function round(value, digits = 2) {
 
-function round(
-  value,
-  digits = 2
-) {
+  const n = Number(value);
 
-  const n =
-    Number(value);
-
-  if (
-    !Number.isFinite(n)
-  ) {
+  if (!Number.isFinite(n)) {
     return null;
   }
 
@@ -122,11 +97,7 @@ function round(
   );
 }
 
-
-function formatPrice(
-  asset,
-  value
-) {
+function formatPrice(asset, value) {
 
   return round(
     value,
@@ -134,10 +105,7 @@ function formatPrice(
   );
 }
 
-
-function assetFromSymbol(
-  symbol
-) {
+function assetFromSymbol(symbol) {
 
   const normalized =
     String(symbol || "")
@@ -160,7 +128,6 @@ function assetFromSymbol(
   return null;
 }
 
-
 function sleep(ms) {
 
   return new Promise(
@@ -176,26 +143,20 @@ function sleep(ms) {
 
 function ensureState(asset) {
 
-  if (
-    !states.has(asset)
-  ) {
+  if (!states.has(asset)) {
 
     states.set(
       asset,
       {
-
         asset,
 
         lastPrice: null,
-
         lastTickAt: null,
 
         currentM5: null,
-
         currentM15: null,
 
         closedM5: [],
-
         closedM15: [],
 
         bootstrapped: false
@@ -281,7 +242,7 @@ function saveHistory() {
 
 
 /* =====================================================
-   RUNTIME STATE
+   RUNTIME
 ===================================================== */
 
 function loadRuntimeState() {
@@ -303,7 +264,6 @@ function loadRuntimeState() {
           "utf8"
         )
       );
-
 
     if (
       Array.isArray(
@@ -329,18 +289,14 @@ function loadRuntimeState() {
       }
     }
 
-
     if (
       parsed.lastSignalTimes &&
       typeof parsed.lastSignalTimes ===
-      "object"
+        "object"
     ) {
 
       for (
-        const [
-          asset,
-          value
-        ]
+        const [asset, value]
         of Object.entries(
           parsed.lastSignalTimes
         )
@@ -361,9 +317,8 @@ function loadRuntimeState() {
       }
     }
 
-
     console.log(
-      `Runtime restored | open trades ${openTrades.size}`
+      `Runtime restored | Open trades ${openTrades.size}`
     );
 
   } catch (error) {
@@ -391,14 +346,12 @@ function saveRuntimeState() {
         value;
     }
 
-
     fs.writeFileSync(
 
       RUNTIME_FILE,
 
       JSON.stringify(
         {
-
           openTrades:
             Array.from(
               openTrades.values()
@@ -409,7 +362,6 @@ function saveRuntimeState() {
 
           savedAt:
             nowIso()
-
         },
         null,
         2
@@ -432,10 +384,7 @@ function saveRuntimeState() {
    EMA
 ===================================================== */
 
-function ema(
-  values,
-  period
-) {
+function ema(values, period) {
 
   if (
     !Array.isArray(values) ||
@@ -445,10 +394,8 @@ function ema(
     return null;
   }
 
-
   const multiplier =
     2 / (period + 1);
-
 
   let current =
     values
@@ -458,7 +405,6 @@ function ema(
           sum + value,
         0
       ) / period;
-
 
   for (
     let i = period;
@@ -475,13 +421,12 @@ function ema(
       current;
   }
 
-
   return current;
 }
 
 
 /* =====================================================
-   RSI 14
+   RSI
 ===================================================== */
 
 function rsi(
@@ -498,17 +443,13 @@ function rsi(
     return null;
   }
 
-
   const recent =
     values.slice(
       -(period + 1)
     );
 
-
   let gains = 0;
-
   let losses = 0;
-
 
   for (
     let i = 1;
@@ -519,7 +460,6 @@ function rsi(
     const diff =
       recent[i] -
       recent[i - 1];
-
 
     if (
       diff > 0
@@ -534,13 +474,11 @@ function rsi(
     }
   }
 
-
   const avgGain =
     gains / period;
 
   const avgLoss =
     losses / period;
-
 
   if (
     avgLoss === 0
@@ -549,11 +487,9 @@ function rsi(
     return 100;
   }
 
-
   const rs =
     avgGain /
     avgLoss;
-
 
   return (
     100 -
@@ -563,7 +499,7 @@ function rsi(
 
 
 /* =====================================================
-   ATR 14
+   ATR
 ===================================================== */
 
 function atr(
@@ -580,9 +516,7 @@ function atr(
     return null;
   }
 
-
   const trValues = [];
-
 
   for (
     let i = 1;
@@ -595,7 +529,6 @@ function atr(
 
     const previous =
       candles[i - 1];
-
 
     const tr =
       Math.max(
@@ -614,20 +547,18 @@ function atr(
         )
       );
 
-
     trValues.push(tr);
   }
-
 
   const recent =
     trValues.slice(
       -period
     );
 
-
   return (
     recent.reduce(
-      (a, b) => a + b,
+      (a, b) =>
+        a + b,
       0
     ) /
     recent.length
@@ -652,12 +583,10 @@ function momentumPercent(
     return 0;
   }
 
-
   const current =
     values[
       values.length - 1
     ];
-
 
   const previous =
     values[
@@ -666,7 +595,6 @@ function momentumPercent(
       period
     ];
 
-
   if (
     !Number.isFinite(previous) ||
     previous === 0
@@ -674,7 +602,6 @@ function momentumPercent(
 
     return 0;
   }
-
 
   return (
     (
@@ -688,7 +615,7 @@ function momentumPercent(
 
 
 /* =====================================================
-   CANDLE BUCKET
+   CANDLE
 ===================================================== */
 
 function candleBucket(
@@ -706,10 +633,6 @@ function candleBucket(
 }
 
 
-/* =====================================================
-   ADD CLOSED CANDLE
-===================================================== */
-
 function addClosedCandle(
   array,
   candle
@@ -719,14 +642,12 @@ function addClosedCandle(
     return;
   }
 
-
   const index =
     array.findIndex(
       item =>
         item.start ===
         candle.start
     );
-
 
   if (
     index >= 0
@@ -743,12 +664,10 @@ function addClosedCandle(
     });
   }
 
-
   array.sort(
     (a, b) =>
       a.start - b.start
   );
-
 
   while (
     array.length >
@@ -761,7 +680,7 @@ function addClosedCandle(
 
 
 /* =====================================================
-   M5 -> CLOSED M15
+   M5 -> M15
 ===================================================== */
 
 function aggregateClosedM15(
@@ -778,10 +697,8 @@ function aggregateClosedM15(
       900
     );
 
-
   const groups =
     new Map();
-
 
   for (
     const candle
@@ -794,12 +711,6 @@ function aggregateClosedM15(
         900
       );
 
-
-    /*
-      Never place current M15
-      inside closed M15.
-    */
-
     if (
       bucket >=
       currentM15Bucket
@@ -807,7 +718,6 @@ function aggregateClosedM15(
 
       continue;
     }
-
 
     if (
       !groups.has(bucket)
@@ -819,15 +729,12 @@ function aggregateClosedM15(
       );
     }
 
-
     groups
       .get(bucket)
       .push(candle);
   }
 
-
   const result = [];
-
 
   for (
     const [bucket, group]
@@ -842,26 +749,11 @@ function aggregateClosedM15(
             a.start - b.start
         );
 
-
-    /*
-      M15 must contain exactly:
-      00
-      05
-      10
-
-      Three complete M5 candles.
-    */
-
     const requiredStarts = [
-
       bucket,
-
       bucket + 300,
-
       bucket + 600
-
     ];
-
 
     const valid =
       requiredStarts.every(
@@ -873,11 +765,9 @@ function aggregateClosedM15(
           )
       );
 
-
     if (!valid) {
       continue;
     }
-
 
     const complete =
       requiredStarts.map(
@@ -888,7 +778,6 @@ function aggregateClosedM15(
               start
           )
       );
-
 
     result.push({
 
@@ -913,13 +802,9 @@ function aggregateClosedM15(
         ),
 
       close:
-        complete[
-          complete.length - 1
-        ].close
-
+        complete[2].close
     });
   }
-
 
   return result
     .sort(
@@ -933,16 +818,13 @@ function aggregateClosedM15(
 
 
 /* =====================================================
-   CURRENT M15 FROM M5
+   CURRENT M15
 ===================================================== */
 
 function buildCurrentM15(
   closedM5,
   currentM5,
-  timestampSec =
-    Math.floor(
-      Date.now() / 1000
-    )
+  timestampSec
 ) {
 
   const bucket =
@@ -951,12 +833,12 @@ function buildCurrentM15(
       900
     );
 
-
   const parts =
     closedM5
       .filter(
         candle =>
-          candle.start >= bucket &&
+          candle.start >=
+            bucket &&
           candle.start <
             bucket + 900
       )
@@ -966,7 +848,6 @@ function buildCurrentM15(
         })
       );
 
-
   if (
     currentM5 &&
     currentM5.start >= bucket &&
@@ -974,19 +855,18 @@ function buildCurrentM15(
       bucket + 900
   ) {
 
-    const existing =
+    const index =
       parts.findIndex(
         x =>
           x.start ===
           currentM5.start
       );
 
-
     if (
-      existing >= 0
+      index >= 0
     ) {
 
-      parts[existing] = {
+      parts[index] = {
         ...currentM5
       };
 
@@ -998,12 +878,10 @@ function buildCurrentM15(
     }
   }
 
-
   parts.sort(
     (a, b) =>
       a.start - b.start
   );
-
 
   if (
     parts.length === 0
@@ -1011,7 +889,6 @@ function buildCurrentM15(
 
     return null;
   }
-
 
   return {
 
@@ -1044,7 +921,7 @@ function buildCurrentM15(
 
 
 /* =====================================================
-   REST BOOTSTRAP
+   BOOTSTRAP
 ===================================================== */
 
 async function bootstrapAsset(
@@ -1054,10 +931,8 @@ async function bootstrapAsset(
   const state =
     ensureState(asset);
 
-
   const symbol =
     ASSETS[asset].symbol;
-
 
   const url =
     "https://api.twelvedata.com/time_series" +
@@ -1068,21 +943,17 @@ async function bootstrapAsset(
       TWELVE_DATA_API_KEY
     )}`;
 
-
   console.log(
     `Bootstrap ${asset} M5...`
   );
 
-
   const response =
     await fetch(url);
-
 
   const data =
     await response
       .json()
       .catch(() => ({}));
-
 
   if (
     !response.ok ||
@@ -1095,7 +966,6 @@ async function bootstrapAsset(
       `Bootstrap failed ${asset}`
     );
   }
-
 
   const candles =
     data.values
@@ -1112,7 +982,6 @@ async function bootstrapAsset(
               ) +
               "Z"
           );
-
 
         return {
 
@@ -1133,7 +1002,6 @@ async function bootstrapAsset(
 
           close:
             Number(item.close)
-
         };
       })
       .filter(
@@ -1156,29 +1024,16 @@ async function bootstrapAsset(
       )
       .reverse();
 
-
   const nowSec =
     Math.floor(
       Date.now() / 1000
     );
-
 
   const currentM5Bucket =
     candleBucket(
       nowSec,
       300
     );
-
-
-  /*
-    IMPORTANT FIX:
-
-    All candles BEFORE current
-    M5 bucket are closed.
-
-    Current bucket is kept
-    separate as currentM5.
-  */
 
   state.closedM5 =
     candles
@@ -1191,7 +1046,6 @@ async function bootstrapAsset(
         -MAX_CANDLES
       );
 
-
   const current =
     candles.find(
       candle =>
@@ -1199,24 +1053,16 @@ async function bootstrapAsset(
         currentM5Bucket
     );
 
-
   state.currentM5 =
     current
       ? { ...current }
       : null;
-
-
-  /*
-    Only COMPLETE groups of
-    three M5 candles become M15.
-  */
 
   state.closedM15 =
     aggregateClosedM15(
       state.closedM5,
       nowSec
     );
-
 
   state.currentM15 =
     buildCurrentM15(
@@ -1225,15 +1071,15 @@ async function bootstrapAsset(
       nowSec
     );
 
-
   const latest =
     state.currentM5 ||
     state.closedM5[
       state.closedM5.length - 1
     ];
 
-
-  if (latest) {
+  if (
+    latest
+  ) {
 
     state.lastPrice =
       formatPrice(
@@ -1242,22 +1088,19 @@ async function bootstrapAsset(
       );
   }
 
-
   state.bootstrapped =
     true;
 
-
   console.log(
-    `${asset} BOOTSTRAP OK | CLOSED M5 ${state.closedM5.length} | CLOSED M15 ${state.closedM15.length}`
+    `${asset} BOOTSTRAP OK | M5 ${state.closedM5.length} | M15 ${state.closedM15.length}`
   );
-
 
   refreshSignal(asset);
 }
 
 
 /* =====================================================
-   LIVE M5 CANDLE
+   LIVE M5
 ===================================================== */
 
 function updateLiveM5(
@@ -1272,10 +1115,8 @@ function updateLiveM5(
       300
     );
 
-
   let current =
     state.currentM5;
-
 
   if (!current) {
 
@@ -1297,14 +1138,8 @@ function updateLiveM5(
         price
     };
 
-
     return false;
   }
-
-
-  /*
-    Same M5 candle.
-  */
 
   if (
     bucket ===
@@ -1326,14 +1161,8 @@ function updateLiveM5(
     current.close =
       price;
 
-
     return false;
   }
-
-
-  /*
-    Ignore older/out-of-order tick.
-  */
 
   if (
     bucket <
@@ -1343,16 +1172,10 @@ function updateLiveM5(
     return false;
   }
 
-
-  /*
-    Previous M5 is now CLOSED.
-  */
-
   addClosedCandle(
     state.closedM5,
     current
   );
-
 
   state.currentM5 = {
 
@@ -1371,7 +1194,6 @@ function updateLiveM5(
     close:
       price
   };
-
 
   return true;
 }
@@ -1392,13 +1214,6 @@ function analyseTimeframe(
     ...closedCandles
   ];
 
-
-  /*
-    FAST MODE:
-    current live candle is also used
-    for live confirmation.
-  */
-
   if (
     currentCandle
   ) {
@@ -1407,7 +1222,6 @@ function analyseTimeframe(
       ...currentCandle
     });
   }
-
 
   if (
     candles.length < 25
@@ -1436,10 +1250,8 @@ function analyseTimeframe(
     };
   }
 
-
   const recent =
     candles.slice(-80);
-
 
   const closes =
     recent.map(
@@ -1447,18 +1259,15 @@ function analyseTimeframe(
         candle.close
     );
 
-
   const last =
     recent[
       recent.length - 1
     ];
 
-
   const previous =
     recent[
       recent.length - 2
     ];
-
 
   const ema9 =
     ema(
@@ -1466,13 +1275,11 @@ function analyseTimeframe(
       9
     );
 
-
   const ema21 =
     ema(
       closes,
       21
     );
-
 
   const currentRsi =
     rsi(
@@ -1480,13 +1287,11 @@ function analyseTimeframe(
       14
     );
 
-
   const currentAtr =
     atr(
       recent,
       14
     );
-
 
   const momentum =
     momentumPercent(
@@ -1494,147 +1299,102 @@ function analyseTimeframe(
       3
     );
 
-
   let score = 0;
-
-
-  /* EMA TREND */
 
   if (
     ema9 > ema21
   ) {
-
     score += 3;
   }
-
 
   if (
     ema9 < ema21
   ) {
-
     score -= 3;
   }
-
-
-  /* PRICE VS EMA */
 
   if (
     last.close > ema9
   ) {
-
     score += 1;
   }
-
 
   if (
     last.close < ema9
   ) {
-
     score -= 1;
   }
-
-
-  /* RSI BUY */
 
   if (
     currentRsi >= 52 &&
     currentRsi <= 72
   ) {
-
     score += 2;
   }
-
-
-  /* RSI SELL */
 
   if (
     currentRsi <= 48 &&
     currentRsi >= 28
   ) {
-
     score -= 2;
   }
-
-
-  /* MOMENTUM */
 
   if (
     momentum > 0.015
   ) {
-
     score += 2;
   }
-
 
   if (
     momentum < -0.015
   ) {
-
     score -= 2;
   }
 
-
-  /* CURRENT CANDLE */
-
   if (
     last.close >
     last.open
   ) {
-
     score += 1;
   }
-
 
   if (
     last.close <
     last.open
   ) {
-
     score -= 1;
   }
-
-
-  /* FOLLOW THROUGH */
 
   if (
     last.close >
     previous.close
   ) {
-
     score += 1;
   }
-
 
   if (
     last.close <
     previous.close
   ) {
-
     score -= 1;
   }
-
 
   let status =
     "WAIT";
 
-
   if (
     score >= 4
   ) {
-
     status =
       "BUY";
   }
 
-
   if (
     score <= -4
   ) {
-
     status =
       "SELL";
   }
-
 
   const confidence =
     status === "WAIT"
@@ -1651,17 +1411,12 @@ function analyseTimeframe(
           Math.abs(score) * 5
         );
 
-
   return {
 
     asset,
-
     timeframe,
-
     status,
-
     score,
-
     confidence,
 
     price:
@@ -1728,11 +1483,6 @@ function combineSignals(
   let reason =
     "Waiting for confirmation";
 
-
-  /*
-    FULL BUY CONFIRMATION
-  */
-
   if (
     m5.status === "BUY" &&
     m15.status === "BUY"
@@ -1741,22 +1491,17 @@ function combineSignals(
     direction =
       "BUY";
 
-
     confidence =
       Math.round(
-        m5.confidence * 0.6 +
-        m15.confidence * 0.4
+        m5.confidence *
+        0.6 +
+        m15.confidence *
+        0.4
       );
-
 
     reason =
       "M5 + M15 BUY confirmation";
   }
-
-
-  /*
-    FULL SELL CONFIRMATION
-  */
 
   if (
     m5.status === "SELL" &&
@@ -1766,22 +1511,17 @@ function combineSignals(
     direction =
       "SELL";
 
-
     confidence =
       Math.round(
-        m5.confidence * 0.6 +
-        m15.confidence * 0.4
+        m5.confidence *
+        0.6 +
+        m15.confidence *
+        0.4
       );
-
 
     reason =
       "M5 + M15 SELL confirmation";
   }
-
-
-  /*
-    FAST BUY
-  */
 
   if (
     direction === "WAIT" &&
@@ -1793,13 +1533,10 @@ function combineSignals(
     direction =
       "BUY";
 
-
     confidence =
       Math.round(
-
         m5.confidence *
         0.75 +
-
         Math.max(
           55,
           m15.confidence
@@ -1807,15 +1544,9 @@ function combineSignals(
         0.25
       );
 
-
     reason =
       "FAST M5 BUY + M15 not bearish";
   }
-
-
-  /*
-    FAST SELL
-  */
 
   if (
     direction === "WAIT" &&
@@ -1827,13 +1558,10 @@ function combineSignals(
     direction =
       "SELL";
 
-
     confidence =
       Math.round(
-
         m5.confidence *
         0.75 +
-
         Math.max(
           55,
           m15.confidence
@@ -1841,11 +1569,9 @@ function combineSignals(
         0.25
       );
 
-
     reason =
       "FAST M5 SELL + M15 not bullish";
   }
-
 
   if (
     confidence <
@@ -1859,7 +1585,6 @@ function combineSignals(
       "Confidence below minimum";
   }
 
-
   return {
 
     asset,
@@ -1871,9 +1596,7 @@ function combineSignals(
       ASSETS[asset].symbol,
 
     direction,
-
     confidence,
-
     reason,
 
     price:
@@ -1892,44 +1615,29 @@ function combineSignals(
 
 
 /* =====================================================
-   REFRESH SIGNAL
+   REFRESH
 ===================================================== */
 
-function refreshSignal(
-  asset
-) {
+function refreshSignal(asset) {
 
   const state =
     ensureState(asset);
 
-
   const m5 =
     analyseTimeframe(
-
       asset,
-
       "M5",
-
       state.closedM5,
-
       state.currentM5
-
     );
-
 
   const m15 =
     analyseTimeframe(
-
       asset,
-
       "M15",
-
       state.closedM15,
-
       state.currentM15
-
     );
-
 
   const finalSignal =
     combineSignals(
@@ -1938,12 +1646,10 @@ function refreshSignal(
       m15
     );
 
-
   signals.set(
     asset,
     finalSignal
   );
-
 
   return finalSignal;
 }
@@ -1971,7 +1677,6 @@ async function sendPush(
     return false;
   }
 
-
   try {
 
     const response =
@@ -1980,7 +1685,6 @@ async function sendPush(
         "https://api.onesignal.com/notifications",
 
         {
-
           method:
             "POST",
 
@@ -2012,18 +1716,14 @@ async function sendPush(
               },
 
               data
-
             })
-
         }
       );
-
 
     const result =
       await response
         .json()
         .catch(() => ({}));
-
 
     if (
       !response.ok
@@ -2037,12 +1737,10 @@ async function sendPush(
       return false;
     }
 
-
     console.log(
       "PUSH SENT:",
       title
     );
-
 
     return true;
 
@@ -2053,14 +1751,13 @@ async function sendPush(
       error.message
     );
 
-
     return false;
   }
 }
 
 
 /* =====================================================
-   TRADE LEVELS
+   LEVELS
 ===================================================== */
 
 function createTradeLevels(
@@ -2073,12 +1770,10 @@ function createTradeLevels(
       signal.price
     );
 
-
   const atrValue =
     Number(
       signal.M5?.atr
     );
-
 
   if (
     !Number.isFinite(entry) ||
@@ -2088,7 +1783,6 @@ function createTradeLevels(
 
     return null;
   }
-
 
   if (
     signal.direction === "BUY"
@@ -2132,7 +1826,6 @@ function createTradeLevels(
     };
   }
 
-
   if (
     signal.direction === "SELL"
   ) {
@@ -2175,7 +1868,6 @@ function createTradeLevels(
     };
   }
 
-
   return null;
 }
 
@@ -2193,42 +1885,33 @@ async function maybeOpenTrade(
     !signal ||
     signal.direction === "WAIT"
   ) {
-
     return;
   }
-
 
   if (
     openTrades.has(asset)
   ) {
-
     return;
   }
-
 
   if (
     openTrades.size >=
     MAX_OPEN_TRADES
   ) {
-
     return;
   }
-
 
   const lastTime =
     lastSignalTimes.get(asset)
     || 0;
-
 
   if (
     Date.now() -
     lastTime <
     SIGNAL_COOLDOWN_MS
   ) {
-
     return;
   }
-
 
   const levels =
     createTradeLevels(
@@ -2236,12 +1919,9 @@ async function maybeOpenTrade(
       signal
     );
 
-
   if (!levels) {
-
     return;
   }
-
 
   const trade = {
 
@@ -2299,21 +1979,17 @@ async function maybeOpenTrade(
       nowIso()
   };
 
-
   openTrades.set(
     asset,
     trade
   );
-
 
   lastSignalTimes.set(
     asset,
     Date.now()
   );
 
-
   saveRuntimeState();
-
 
   await sendPush(
 
@@ -2322,16 +1998,13 @@ async function maybeOpenTrade(
     `Entry ${trade.entry} | SL ${trade.sl} | TP1 ${trade.tp1} | TP2 ${trade.tp2} | TP3 ${trade.tp3} | Confidence ${trade.confidence}%`,
 
     {
-
       event:
         "NEW_SIGNAL",
 
       asset,
-
       trade
     }
   );
-
 
   console.log(
     "NEW TRADE",
@@ -2343,7 +2016,7 @@ async function maybeOpenTrade(
 
 
 /* =====================================================
-   CLOSE TRADE
+   CLOSE
 ===================================================== */
 
 async function closeTrade(
@@ -2356,29 +2029,23 @@ async function closeTrade(
   trade.status =
     result;
 
-
   trade.exit =
     formatPrice(
       asset,
       price
     );
 
-
   trade.closedAt =
     nowIso();
-
 
   trade.updatedAt =
     nowIso();
 
-
   openTrades.delete(asset);
-
 
   history.unshift({
     ...trade
   });
-
 
   history =
     history.slice(
@@ -2386,11 +2053,8 @@ async function closeTrade(
       500
     );
 
-
   saveHistory();
-
   saveRuntimeState();
-
 
   await sendPush(
 
@@ -2399,16 +2063,13 @@ async function closeTrade(
     `${trade.direction} | Entry ${trade.entry} | Exit ${trade.exit}`,
 
     {
-
       event:
         result,
 
       asset,
-
       trade
     }
   );
-
 
   console.log(
     "TRADE CLOSED",
@@ -2430,40 +2091,29 @@ async function trackTrade(
   const trade =
     openTrades.get(asset);
 
-
   if (!trade) {
     return;
   }
 
-
   const price =
     Number(currentPrice);
-
 
   if (
     !Number.isFinite(price)
   ) {
-
     return;
   }
-
 
   trade.updatedAt =
     nowIso();
 
 
-  /* ===================================================
-     BUY
-  =================================================== */
+  /* BUY */
 
   if (
     trade.direction === "BUY"
   ) {
 
-    /*
-      TP1
-    */
-
     if (
       !trade.tp1Hit &&
       price >=
@@ -2482,9 +2132,7 @@ async function trackTrade(
       trade.status =
         "TP1";
 
-
       saveRuntimeState();
-
 
       await sendPush(
 
@@ -2493,21 +2141,14 @@ async function trackTrade(
         `TP1 ${trade.tp1} hit. Move SL to ENTRY ${trade.entry}.`,
 
         {
-
           event:
             "TP1",
 
           asset,
-
           trade
         }
       );
     }
-
-
-    /*
-      TP2
-    */
 
     if (
       !trade.tp2Hit &&
@@ -2521,9 +2162,7 @@ async function trackTrade(
       trade.status =
         "TP2";
 
-
       saveRuntimeState();
-
 
       await sendPush(
 
@@ -2532,21 +2171,14 @@ async function trackTrade(
         `TP2 ${trade.tp2} hit.`,
 
         {
-
           event:
             "TP2",
 
           asset,
-
           trade
         }
       );
     }
-
-
-    /*
-      TP3
-    */
 
     if (
       !trade.tp3Hit &&
@@ -2557,9 +2189,7 @@ async function trackTrade(
       trade.tp3Hit =
         true;
 
-
       saveRuntimeState();
-
 
       await sendPush(
 
@@ -2568,16 +2198,13 @@ async function trackTrade(
         `TP3 ${trade.tp3} hit.`,
 
         {
-
           event:
             "TP3",
 
           asset,
-
           trade
         }
       );
-
 
       await closeTrade(
         asset,
@@ -2586,14 +2213,8 @@ async function trackTrade(
         price
       );
 
-
       return;
     }
-
-
-    /*
-      SL / BREAK EVEN
-    */
 
     if (
       price <=
@@ -2605,32 +2226,22 @@ async function trackTrade(
           ? "BREAK-EVEN"
           : "LOST";
 
-
       await closeTrade(
         asset,
         trade,
         result,
         price
       );
-
-
-      return;
     }
   }
 
 
-  /* ===================================================
-     SELL
-  =================================================== */
+  /* SELL */
 
   if (
     trade.direction === "SELL"
   ) {
 
-    /*
-      TP1
-    */
-
     if (
       !trade.tp1Hit &&
       price <=
@@ -2649,9 +2260,7 @@ async function trackTrade(
       trade.status =
         "TP1";
 
-
       saveRuntimeState();
-
 
       await sendPush(
 
@@ -2660,21 +2269,14 @@ async function trackTrade(
         `TP1 ${trade.tp1} hit. Move SL to ENTRY ${trade.entry}.`,
 
         {
-
           event:
             "TP1",
 
           asset,
-
           trade
         }
       );
     }
-
-
-    /*
-      TP2
-    */
 
     if (
       !trade.tp2Hit &&
@@ -2688,9 +2290,7 @@ async function trackTrade(
       trade.status =
         "TP2";
 
-
       saveRuntimeState();
-
 
       await sendPush(
 
@@ -2699,21 +2299,14 @@ async function trackTrade(
         `TP2 ${trade.tp2} hit.`,
 
         {
-
           event:
             "TP2",
 
           asset,
-
           trade
         }
       );
     }
-
-
-    /*
-      TP3
-    */
 
     if (
       !trade.tp3Hit &&
@@ -2724,9 +2317,7 @@ async function trackTrade(
       trade.tp3Hit =
         true;
 
-
       saveRuntimeState();
-
 
       await sendPush(
 
@@ -2735,16 +2326,13 @@ async function trackTrade(
         `TP3 ${trade.tp3} hit.`,
 
         {
-
           event:
             "TP3",
 
           asset,
-
           trade
         }
       );
-
 
       await closeTrade(
         asset,
@@ -2753,14 +2341,8 @@ async function trackTrade(
         price
       );
 
-
       return;
     }
-
-
-    /*
-      SL / BREAK EVEN
-    */
 
     if (
       price >=
@@ -2772,16 +2354,12 @@ async function trackTrade(
           ? "BREAK-EVEN"
           : "LOST";
 
-
       await closeTrade(
         asset,
         trade,
         result,
         price
       );
-
-
-      return;
     }
   }
 }
@@ -2800,23 +2378,19 @@ async function handlePrice(
       message.symbol
     );
 
-
   if (!asset) {
     return;
   }
-
 
   const price =
     Number(
       message.price
     );
 
-
   const timestampSec =
     Number(
       message.timestamp
     );
-
 
   if (
     !Number.isFinite(price) ||
@@ -2826,10 +2400,8 @@ async function handlePrice(
     return;
   }
 
-
   const state =
     ensureState(asset);
-
 
   state.lastPrice =
     formatPrice(
@@ -2837,21 +2409,14 @@ async function handlePrice(
       price
     );
 
-
   state.lastTickAt =
     new Date(
       timestampSec *
       1000
     ).toISOString();
 
-
   wsLastEvent =
     nowIso();
-
-
-  /*
-    Update M5 first.
-  */
 
   const newM5 =
     updateLiveM5(
@@ -2859,12 +2424,6 @@ async function handlePrice(
       price,
       timestampSec
     );
-
-
-  /*
-    When a new M5 begins,
-    rebuild COMPLETE M15 candles.
-  */
 
   if (
     newM5
@@ -2877,12 +2436,6 @@ async function handlePrice(
       );
   }
 
-
-  /*
-    Current M15 is always built
-    from M5 data.
-  */
-
   state.currentM15 =
     buildCurrentM15(
       state.closedM5,
@@ -2890,28 +2443,13 @@ async function handlePrice(
       timestampSec
     );
 
-
-  /*
-    Refresh algorithm.
-  */
-
   const signal =
     refreshSignal(asset);
-
-
-  /*
-    Track existing trade first.
-  */
 
   await trackTrade(
     asset,
     price
   );
-
-
-  /*
-    Then check new trade.
-  */
 
   await maybeOpenTrade(
     asset,
@@ -2934,9 +2472,7 @@ function scheduleReconnect() {
     return;
   }
 
-
   reconnectAttempt += 1;
-
 
   const waitMs =
     Math.min(
@@ -2949,18 +2485,7 @@ function scheduleReconnect() {
         reconnectAttempt - 1,
         5
       )
-
     );
-
-
-  console.log(
-    "Reconnect in",
-    Math.round(
-      waitMs / 1000
-    ),
-    "sec"
-  );
-
 
   reconnectTimer =
     setTimeout(
@@ -2990,39 +2515,30 @@ function connectWebSocket() {
     return;
   }
 
-
-  /*
-    Prevent two sockets.
-  */
-
   if (
     ws &&
     (
       ws.readyState ===
-      WebSocket.OPEN ||
+        WebSocket.OPEN ||
       ws.readyState ===
-      WebSocket.CONNECTING
+        WebSocket.CONNECTING
     )
   ) {
 
     return;
   }
 
-
   const url =
     `wss://ws.twelvedata.com/v1/quotes/price?apikey=${encodeURIComponent(
       TWELVE_DATA_API_KEY
     )}`;
 
-
   console.log(
     "Connecting Twelve Data WebSocket..."
   );
 
-
   ws =
     new WebSocket(url);
-
 
   ws.on(
     "open",
@@ -3034,11 +2550,9 @@ function connectWebSocket() {
       reconnectAttempt =
         0;
 
-
       console.log(
         "TWELVE DATA WEBSOCKET CONNECTED"
       );
-
 
       ws.send(
         JSON.stringify({
@@ -3055,21 +2569,17 @@ function connectWebSocket() {
                   x => x.symbol
                 )
                 .join(",")
-
           }
-
         })
       );
     }
   );
-
 
   ws.on(
     "message",
     raw => {
 
       let message;
-
 
       try {
 
@@ -3082,7 +2592,6 @@ function connectWebSocket() {
 
         return;
       }
-
 
       if (
         message.event ===
@@ -3098,14 +2607,11 @@ function connectWebSocket() {
               "PRICE ERROR:",
               error.message
             );
-
           }
         );
 
-
         return;
       }
-
 
       console.log(
         "WS:",
@@ -3115,7 +2621,6 @@ function connectWebSocket() {
       );
     }
   );
-
 
   ws.on(
     "error",
@@ -3128,7 +2633,6 @@ function connectWebSocket() {
     }
   );
 
-
   ws.on(
     "close",
     () => {
@@ -3136,13 +2640,12 @@ function connectWebSocket() {
       wsConnected =
         false;
 
-      ws = null;
-
+      ws =
+        null;
 
       console.log(
         "WEBSOCKET CLOSED"
       );
-
 
       scheduleReconnect();
     }
@@ -3154,9 +2657,7 @@ function connectWebSocket() {
    STATS
 ===================================================== */
 
-function calculateStats(
-  items
-) {
+function calculateStats(items) {
 
   const wins =
     items.filter(
@@ -3164,13 +2665,11 @@ function calculateStats(
         x.status === "WIN"
     ).length;
 
-
   const losses =
     items.filter(
       x =>
         x.status === "LOST"
     ).length;
-
 
   const breakEven =
     items.filter(
@@ -3179,10 +2678,9 @@ function calculateStats(
         "BREAK-EVEN"
     ).length;
 
-
   const completed =
-    wins + losses;
-
+    wins +
+    losses;
 
   const winRate =
     completed > 0
@@ -3196,15 +2694,11 @@ function calculateStats(
 
       : 0;
 
-
   return {
 
     wins,
-
     losses,
-
     breakEven,
-
     winRate,
 
     total:
@@ -3220,22 +2714,23 @@ function getStats() {
       history
     );
 
-
-  const goldHistory =
-    history.filter(
-      x =>
-        x.asset ===
-        "XAUUSD"
+  const gold =
+    calculateStats(
+      history.filter(
+        x =>
+          x.asset ===
+          "XAUUSD"
+      )
     );
 
-
-  const btcHistory =
-    history.filter(
-      x =>
-        x.asset ===
-        "BTCUSD"
+  const bitcoin =
+    calculateStats(
+      history.filter(
+        x =>
+          x.asset ===
+          "BTCUSD"
+      )
     );
-
 
   return {
 
@@ -3261,20 +2756,16 @@ function getStats() {
       MAX_OPEN_TRADES,
 
     XAUUSD:
-      calculateStats(
-        goldHistory
-      ),
+      gold,
 
     BTCUSD:
-      calculateStats(
-        btcHistory
-      )
+      bitcoin
   };
 }
 
 
 /* =====================================================
-   HOME
+   ROUTES
 ===================================================== */
 
 app.get(
@@ -3304,6 +2795,12 @@ app.get(
       openTrades:
         openTrades.size,
 
+      oneSignal:
+        ONESIGNAL_APP_ID &&
+        ONESIGNAL_API_KEY
+          ? "configured"
+          : "missing",
+
       status:
         "online"
     });
@@ -3311,20 +2808,17 @@ app.get(
 );
 
 
-/* =====================================================
-   HEALTH
-===================================================== */
-
 app.get(
   "/health",
   (req, res) => {
 
     res.json({
 
-      ok: true,
+      ok:
+        true,
 
       version:
-        "8.7",
+        "8.7 LIVE",
 
       websocketConnected:
         wsConnected,
@@ -3339,16 +2833,11 @@ app.get(
 );
 
 
-/* =====================================================
-   SIGNALS
-===================================================== */
-
 app.get(
   "/api/signals",
   (req, res) => {
 
     const result = {};
-
 
     for (
       const asset
@@ -3357,7 +2846,6 @@ app.get(
 
       const state =
         ensureState(asset);
-
 
       result[asset] =
         signals.get(asset)
@@ -3395,7 +2883,6 @@ app.get(
         };
     }
 
-
     res.json({
 
       ...result,
@@ -3416,16 +2903,11 @@ app.get(
 );
 
 
-/* =====================================================
-   PRICES
-===================================================== */
-
 app.get(
   "/api/prices",
   (req, res) => {
 
     const result = {};
-
 
     for (
       const asset
@@ -3434,7 +2916,6 @@ app.get(
 
       const state =
         ensureState(asset);
-
 
       result[asset] = {
 
@@ -3446,15 +2927,10 @@ app.get(
       };
     }
 
-
     res.json(result);
   }
 );
 
-
-/* =====================================================
-   OPEN TRADES
-===================================================== */
 
 app.get(
   "/api/open-trades",
@@ -3468,10 +2944,6 @@ app.get(
   }
 );
 
-
-/* =====================================================
-   HISTORY
-===================================================== */
 
 app.get(
   "/api/history",
@@ -3488,10 +2960,6 @@ app.get(
 );
 
 
-/* =====================================================
-   STATS
-===================================================== */
-
 app.get(
   "/api/stats",
   (req, res) => {
@@ -3503,16 +2971,11 @@ app.get(
 );
 
 
-/* =====================================================
-   DEBUG
-===================================================== */
-
 app.get(
   "/api/debug",
   (req, res) => {
 
     const result = {};
-
 
     for (
       const asset
@@ -3521,7 +2984,6 @@ app.get(
 
       const state =
         ensureState(asset);
-
 
       result[asset] = {
 
@@ -3553,11 +3015,10 @@ app.get(
       };
     }
 
-
     res.json({
 
       version:
-        "8.7",
+        "8.7 LIVE",
 
       websocketConnected:
         wsConnected,
@@ -3594,7 +3055,6 @@ async function testNotification(
       }
     );
 
-
   res.json({
 
     success,
@@ -3607,12 +3067,10 @@ async function testNotification(
   });
 }
 
-
 app.get(
   "/api/test-notification",
   testNotification
 );
-
 
 app.post(
   "/api/test-notification",
@@ -3621,7 +3079,7 @@ app.post(
 
 
 /* =====================================================
-   START SERVER
+   START
 ===================================================== */
 
 app.listen(
@@ -3629,9 +3087,7 @@ app.listen(
   async () => {
 
     loadHistory();
-
     loadRuntimeState();
-
 
     console.log(
       "===================================="
@@ -3650,19 +3106,7 @@ app.listen(
     );
 
     console.log(
-      "M15 = 3 COMPLETE M5 CANDLES"
-    );
-
-    console.log(
       "TP1 => SL TO ENTRY"
-    );
-
-    console.log(
-      "REST = BOOTSTRAP ONLY"
-    );
-
-    console.log(
-      "LIVE = WEBSOCKET"
     );
 
     console.log(
@@ -3682,15 +3126,6 @@ app.listen(
       "===================================="
     );
 
-
-    /*
-      Only 2 REST requests:
-
-      GOLD M5
-      BITCOIN M5
-    */
-
-
     try {
 
       await bootstrapAsset(
@@ -3705,9 +3140,7 @@ app.listen(
       );
     }
 
-
     await sleep(1200);
-
 
     try {
 
@@ -3723,14 +3156,13 @@ app.listen(
       );
     }
 
-
     connectWebSocket();
   }
 );
 
 
 /* =====================================================
-   SAFE SHUTDOWN
+   SHUTDOWN
 ===================================================== */
 
 function shutdown() {
@@ -3738,11 +3170,8 @@ function shutdown() {
   shuttingDown =
     true;
 
-
   saveHistory();
-
   saveRuntimeState();
-
 
   if (
     reconnectTimer
@@ -3752,7 +3181,6 @@ function shutdown() {
       reconnectTimer
     );
   }
-
 
   try {
 
@@ -3769,16 +3197,13 @@ function shutdown() {
 
   } catch {}
 
-
   process.exit(0);
 }
-
 
 process.on(
   "SIGTERM",
   shutdown
 );
-
 
 process.on(
   "SIGINT",
