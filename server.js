@@ -2,7 +2,6 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import fs from "fs";
-import WebSocket from "ws";
 
 dotenv.config();
 
@@ -11,7 +10,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = Number(process.env.PORT || 10000);
+const PORT =
+  Number(process.env.PORT || 10000);
 
 const TWELVE_DATA_API_KEY =
   process.env.TWELVE_DATA_API_KEY || "";
@@ -22,1642 +22,494 @@ const ONESIGNAL_APP_ID =
 const ONESIGNAL_API_KEY =
   process.env.ONESIGNAL_API_KEY || "";
 
-/* FIXAT LA 68 */
-const MIN_CONFIDENCE = 68;
+const TEST_KEY =
+  process.env.TEST_KEY || "";
 
-const MAX_OPEN_TRADES = 2;
-const MAX_CANDLES = 150;
+const SCAN_SECONDS =
+  Math.max(
+    60,
+    Number(process.env.SCAN_SECONDS || 60)
+  );
 
-const HISTORY_FILE = "./history.json";
-const RUNTIME_FILE = "./runtime-state.json";
-
-const SIGNAL_COOLDOWN_MS =
-  15 * 60 * 1000;
+const STATE_FILE = "./adams-state.json";
 
 
-/* =====================================================
-   ASSETS
-===================================================== */
+// ======================================================
+// SETTINGS
+// ======================================================
 
-const ASSETS = {
+const SYMBOL = "XAU/USD";
 
-  XAUUSD: {
-    symbol: "XAU/USD",
-    label: "GOLD",
-    digits: 2
-  },
+const INTERVAL = "15min";
 
-  BTCUSD: {
-    symbol: "BTC/USD",
-    label: "BITCOIN",
-    digits: 2
-  }
+const EMA_FAST = 9;
+const EMA_SLOW = 21;
+const EMA_TREND = 50;
+
+const RSI_LENGTH = 14;
+const ATR_LENGTH = 14;
+
+const SL_ATR = 1.30;
+
+const TP1_ATR = 1.00;
+const TP2_ATR = 2.00;
+const TP3_ATR = 3.00;
+
+
+// ======================================================
+// STATE
+// ======================================================
+
+let state = {
+
+  lastSignalCandle: null,
+
+  trade: null,
+
+  history: []
 
 };
 
 
-/* =====================================================
-   MEMORY
-===================================================== */
-
-const states = new Map();
-const signals = new Map();
-const openTrades = new Map();
-const lastSignalTimes = new Map();
-
-let history = [];
-
-let ws = null;
-let wsConnected = false;
-let wsLastEvent = null;
-
-let reconnectTimer = null;
-let reconnectAttempt = 0;
-let shuttingDown = false;
-
-
-/* =====================================================
-   HELPERS
-===================================================== */
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function round(value, digits = 2) {
-
-  const n = Number(value);
-
-  if (!Number.isFinite(n)) {
-    return null;
-  }
-
-  return Number(
-    n.toFixed(digits)
-  );
-}
-
-function formatPrice(asset, value) {
-
-  return round(
-    value,
-    ASSETS[asset]?.digits || 2
-  );
-}
-
-function assetFromSymbol(symbol) {
-
-  const normalized =
-    String(symbol || "")
-      .toUpperCase();
-
-  for (
-    const [asset, config]
-    of Object.entries(ASSETS)
-  ) {
-
-    if (
-      config.symbol.toUpperCase() ===
-      normalized
-    ) {
-
-      return asset;
-    }
-  }
-
-  return null;
-}
-
-function sleep(ms) {
-
-  return new Promise(
-    resolve =>
-      setTimeout(resolve, ms)
-  );
-}
-
-
-/* =====================================================
-   STATE
-===================================================== */
-
-function ensureState(asset) {
-
-  if (!states.has(asset)) {
-
-    states.set(
-      asset,
-      {
-        asset,
-
-        lastPrice: null,
-        lastTickAt: null,
-
-        currentM5: null,
-        currentM15: null,
-
-        closedM5: [],
-        closedM15: [],
-
-        bootstrapped: false
-      }
-    );
-  }
-
-  return states.get(asset);
-}
-
-
-/* =====================================================
-   HISTORY
-===================================================== */
-
-function loadHistory() {
+function loadState() {
 
   try {
 
     if (
-      !fs.existsSync(
-        HISTORY_FILE
+      fs.existsSync(
+        STATE_FILE
       )
     ) {
-      return;
-    }
 
-    const parsed =
-      JSON.parse(
+      const data =
         fs.readFileSync(
-          HISTORY_FILE,
+          STATE_FILE,
           "utf8"
-        )
-      );
-
-    if (
-      Array.isArray(parsed)
-    ) {
-
-      history =
-        parsed.slice(
-          0,
-          500
         );
+
+      state =
+        JSON.parse(data);
+
     }
 
   } catch (error) {
 
     console.log(
-      "History load warning:",
+      "STATE LOAD ERROR:",
       error.message
     );
 
-    history = [];
   }
+
 }
 
 
-function saveHistory() {
+function saveState() {
 
   try {
 
     fs.writeFileSync(
-      HISTORY_FILE,
-
+      STATE_FILE,
       JSON.stringify(
-        history.slice(0, 500),
+        state,
         null,
         2
-      ),
-
-      "utf8"
-    );
-
-  } catch (error) {
-
-    console.log(
-      "History save warning:",
-      error.message
-    );
-  }
-}
-
-
-/* =====================================================
-   RUNTIME
-===================================================== */
-
-function loadRuntimeState() {
-
-  try {
-
-    if (
-      !fs.existsSync(
-        RUNTIME_FILE
       )
-    ) {
-      return;
-    }
-
-    const parsed =
-      JSON.parse(
-        fs.readFileSync(
-          RUNTIME_FILE,
-          "utf8"
-        )
-      );
-
-    if (
-      Array.isArray(
-        parsed.openTrades
-      )
-    ) {
-
-      for (
-        const trade
-        of parsed.openTrades
-      ) {
-
-        if (
-          trade?.asset &&
-          ASSETS[trade.asset]
-        ) {
-
-          openTrades.set(
-            trade.asset,
-            trade
-          );
-        }
-      }
-    }
-
-    if (
-      parsed.lastSignalTimes &&
-      typeof parsed.lastSignalTimes ===
-        "object"
-    ) {
-
-      for (
-        const [asset, value]
-        of Object.entries(
-          parsed.lastSignalTimes
-        )
-      ) {
-
-        if (
-          ASSETS[asset] &&
-          Number.isFinite(
-            Number(value)
-          )
-        ) {
-
-          lastSignalTimes.set(
-            asset,
-            Number(value)
-          );
-        }
-      }
-    }
-
-    console.log(
-      `Runtime restored | Open trades ${openTrades.size}`
     );
 
   } catch (error) {
 
     console.log(
-      "Runtime load warning:",
+      "STATE SAVE ERROR:",
       error.message
     );
+
   }
+
 }
 
 
-function saveRuntimeState() {
+loadState();
 
-  try {
 
-    const signalTimes = {};
+// ======================================================
+// HELPERS
+// ======================================================
 
-    for (
-      const [asset, value]
-      of lastSignalTimes.entries()
-    ) {
+function n(value) {
 
-      signalTimes[asset] =
-        value;
-    }
+  return Number(value);
 
-    fs.writeFileSync(
-
-      RUNTIME_FILE,
-
-      JSON.stringify(
-        {
-          openTrades:
-            Array.from(
-              openTrades.values()
-            ),
-
-          lastSignalTimes:
-            signalTimes,
-
-          savedAt:
-            nowIso()
-        },
-        null,
-        2
-      ),
-
-      "utf8"
-    );
-
-  } catch (error) {
-
-    console.log(
-      "Runtime save warning:",
-      error.message
-    );
-  }
 }
 
 
-/* =====================================================
-   EMA
-===================================================== */
+function price(value) {
 
-function ema(values, period) {
+  return Number(value).toFixed(3);
+
+}
+
+
+function parseTime(datetime) {
+
+  if (!datetime) return 0;
+
+  const iso =
+    datetime
+      .replace(
+        " ",
+        "T"
+      ) + "Z";
+
+  return new Date(iso).getTime();
+
+}
+
+
+// ======================================================
+// EMA
+// ======================================================
+
+function emaSeries(
+  values,
+  length
+) {
+
+  const result =
+    new Array(
+      values.length
+    ).fill(null);
 
   if (
-    !Array.isArray(values) ||
-    values.length < period
+    values.length <
+    length
   ) {
 
-    return null;
+    return result;
+
   }
 
-  const multiplier =
-    2 / (period + 1);
-
-  let current =
-    values
-      .slice(0, period)
-      .reduce(
-        (sum, value) =>
-          sum + value,
-        0
-      ) / period;
+  let sum = 0;
 
   for (
-    let i = period;
+    let i = 0;
+    i < length;
+    i++
+  ) {
+
+    sum += values[i];
+
+  }
+
+  let previous =
+    sum / length;
+
+  result[
+    length - 1
+  ] = previous;
+
+  const multiplier =
+    2 / (length + 1);
+
+  for (
+    let i = length;
     i < values.length;
     i++
   ) {
 
-    current =
+    previous =
       (
-        values[i] -
-        current
-      ) *
-      multiplier +
-      current;
+        values[i] *
+        multiplier
+      ) +
+      (
+        previous *
+        (
+          1 -
+          multiplier
+        )
+      );
+
+    result[i] =
+      previous;
+
   }
 
-  return current;
+  return result;
+
 }
 
 
-/* =====================================================
-   RSI
-===================================================== */
+// ======================================================
+// RSI
+// ======================================================
 
-function rsi(
+function rsiSeries(
   values,
-  period = 14
+  length
 ) {
 
+  const result =
+    new Array(
+      values.length
+    ).fill(null);
+
   if (
-    !Array.isArray(values) ||
-    values.length <
-      period + 1
+    values.length <=
+    length
   ) {
 
-    return null;
-  }
+    return result;
 
-  const recent =
-    values.slice(
-      -(period + 1)
-    );
+  }
 
   let gains = 0;
   let losses = 0;
 
   for (
     let i = 1;
-    i < recent.length;
+    i <= length;
     i++
   ) {
 
-    const diff =
-      recent[i] -
-      recent[i - 1];
+    const change =
+      values[i] -
+      values[i - 1];
 
     if (
-      diff > 0
+      change >= 0
     ) {
 
-      gains += diff;
+      gains += change;
 
     } else {
 
       losses +=
-        Math.abs(diff);
+        Math.abs(change);
+
     }
+
   }
 
-  const avgGain =
-    gains / period;
+  let avgGain =
+    gains / length;
 
-  const avgLoss =
-    losses / period;
+  let avgLoss =
+    losses / length;
 
-  if (
+  result[length] =
     avgLoss === 0
-  ) {
-
-    return 100;
-  }
-
-  const rs =
-    avgGain /
-    avgLoss;
-
-  return (
-    100 -
-    100 / (1 + rs)
-  );
-}
-
-
-/* =====================================================
-   ATR
-===================================================== */
-
-function atr(
-  candles,
-  period = 14
-) {
-
-  if (
-    !Array.isArray(candles) ||
-    candles.length <
-      period + 1
-  ) {
-
-    return null;
-  }
-
-  const trValues = [];
+      ? 100
+      : 100 -
+        (
+          100 /
+          (
+            1 +
+            (
+              avgGain /
+              avgLoss
+            )
+          )
+        );
 
   for (
-    let i = 1;
-    i < candles.length;
+    let i =
+      length + 1;
+    i <
+      values.length;
     i++
   ) {
 
-    const current =
-      candles[i];
+    const change =
+      values[i] -
+      values[i - 1];
 
-    const previous =
-      candles[i - 1];
-
-    const tr =
+    const gain =
       Math.max(
-
-        current.high -
-        current.low,
-
-        Math.abs(
-          current.high -
-          previous.close
-        ),
-
-        Math.abs(
-          current.low -
-          previous.close
-        )
+        change,
+        0
       );
 
-    trValues.push(tr);
-  }
-
-  const recent =
-    trValues.slice(
-      -period
-    );
-
-  return (
-    recent.reduce(
-      (a, b) =>
-        a + b,
-      0
-    ) /
-    recent.length
-  );
-}
-
-
-/* =====================================================
-   MOMENTUM
-===================================================== */
-
-function momentumPercent(
-  values,
-  period = 3
-) {
-
-  if (
-    !Array.isArray(values) ||
-    values.length <= period
-  ) {
-
-    return 0;
-  }
-
-  const current =
-    values[
-      values.length - 1
-    ];
-
-  const previous =
-    values[
-      values.length -
-      1 -
-      period
-    ];
-
-  if (
-    !Number.isFinite(previous) ||
-    previous === 0
-  ) {
-
-    return 0;
-  }
-
-  return (
-    (
-      current -
-      previous
-    ) /
-    previous *
-    100
-  );
-}
-
-
-/* =====================================================
-   CANDLE
-===================================================== */
-
-function candleBucket(
-  timestampSec,
-  intervalSec
-) {
-
-  return (
-    Math.floor(
-      timestampSec /
-      intervalSec
-    ) *
-    intervalSec
-  );
-}
-
-
-function addClosedCandle(
-  array,
-  candle
-) {
-
-  if (!candle) {
-    return;
-  }
-
-  const index =
-    array.findIndex(
-      item =>
-        item.start ===
-        candle.start
-    );
-
-  if (
-    index >= 0
-  ) {
-
-    array[index] = {
-      ...candle
-    };
-
-  } else {
-
-    array.push({
-      ...candle
-    });
-  }
-
-  array.sort(
-    (a, b) =>
-      a.start - b.start
-  );
-
-  while (
-    array.length >
-    MAX_CANDLES
-  ) {
-
-    array.shift();
-  }
-}
-
-
-/* =====================================================
-   M5 -> M15
-===================================================== */
-
-function aggregateClosedM15(
-  m5Candles,
-  timestampSec =
-    Math.floor(
-      Date.now() / 1000
-    )
-) {
-
-  const currentM15Bucket =
-    candleBucket(
-      timestampSec,
-      900
-    );
-
-  const groups =
-    new Map();
-
-  for (
-    const candle
-    of m5Candles
-  ) {
-
-    const bucket =
-      candleBucket(
-        candle.start,
-        900
-      );
-
-    if (
-      bucket >=
-      currentM15Bucket
-    ) {
-
-      continue;
-    }
-
-    if (
-      !groups.has(bucket)
-    ) {
-
-      groups.set(
-        bucket,
-        []
-      );
-    }
-
-    groups
-      .get(bucket)
-      .push(candle);
-  }
-
-  const result = [];
-
-  for (
-    const [bucket, group]
-    of groups.entries()
-  ) {
-
-    const sorted =
-      group
-        .slice()
-        .sort(
-          (a, b) =>
-            a.start - b.start
-        );
-
-    const requiredStarts = [
-      bucket,
-      bucket + 300,
-      bucket + 600
-    ];
-
-    const valid =
-      requiredStarts.every(
-        start =>
-          sorted.some(
-            candle =>
-              candle.start ===
-              start
-          )
-      );
-
-    if (!valid) {
-      continue;
-    }
-
-    const complete =
-      requiredStarts.map(
-        start =>
-          sorted.find(
-            candle =>
-              candle.start ===
-              start
-          )
-      );
-
-    result.push({
-
-      start:
-        bucket,
-
-      open:
-        complete[0].open,
-
-      high:
-        Math.max(
-          ...complete.map(
-            x => x.high
-          )
-        ),
-
-      low:
-        Math.min(
-          ...complete.map(
-            x => x.low
-          )
-        ),
-
-      close:
-        complete[2].close
-    });
-  }
-
-  return result
-    .sort(
-      (a, b) =>
-        a.start - b.start
-    )
-    .slice(
-      -MAX_CANDLES
-    );
-}
-
-
-/* =====================================================
-   CURRENT M15
-===================================================== */
-
-function buildCurrentM15(
-  closedM5,
-  currentM5,
-  timestampSec
-) {
-
-  const bucket =
-    candleBucket(
-      timestampSec,
-      900
-    );
-
-  const parts =
-    closedM5
-      .filter(
-        candle =>
-          candle.start >=
-            bucket &&
-          candle.start <
-            bucket + 900
-      )
-      .map(
-        candle => ({
-          ...candle
-        })
-      );
-
-  if (
-    currentM5 &&
-    currentM5.start >= bucket &&
-    currentM5.start <
-      bucket + 900
-  ) {
-
-    const index =
-      parts.findIndex(
-        x =>
-          x.start ===
-          currentM5.start
-      );
-
-    if (
-      index >= 0
-    ) {
-
-      parts[index] = {
-        ...currentM5
-      };
-
-    } else {
-
-      parts.push({
-        ...currentM5
-      });
-    }
-  }
-
-  parts.sort(
-    (a, b) =>
-      a.start - b.start
-  );
-
-  if (
-    parts.length === 0
-  ) {
-
-    return null;
-  }
-
-  return {
-
-    start:
-      bucket,
-
-    open:
-      parts[0].open,
-
-    high:
+    const loss =
       Math.max(
-        ...parts.map(
-          x => x.high
-        )
-      ),
+        -change,
+        0
+      );
 
-    low:
-      Math.min(
-        ...parts.map(
-          x => x.low
-        )
-      ),
+    avgGain =
+      (
+        (
+          avgGain *
+          (
+            length - 1
+          )
+        ) +
+        gain
+      ) /
+      length;
 
-    close:
-      parts[
-        parts.length - 1
-      ].close
-  };
-}
+    avgLoss =
+      (
+        (
+          avgLoss *
+          (
+            length - 1
+          )
+        ) +
+        loss
+      ) /
+      length;
 
-
-/* =====================================================
-   BOOTSTRAP
-===================================================== */
-
-async function bootstrapAsset(
-  asset
-) {
-
-  const state =
-    ensureState(asset);
-
-  const symbol =
-    ASSETS[asset].symbol;
-
-  const url =
-    "https://api.twelvedata.com/time_series" +
-    `?symbol=${encodeURIComponent(symbol)}` +
-    "&interval=5min" +
-    "&outputsize=100" +
-    `&apikey=${encodeURIComponent(
-      TWELVE_DATA_API_KEY
-    )}`;
-
-  console.log(
-    `Bootstrap ${asset} M5...`
-  );
-
-  const response =
-    await fetch(url);
-
-  const data =
-    await response
-      .json()
-      .catch(() => ({}));
-
-  if (
-    !response.ok ||
-    data.status === "error" ||
-    !Array.isArray(data.values)
-  ) {
-
-    throw new Error(
-      data.message ||
-      `Bootstrap failed ${asset}`
-    );
-  }
-
-  const candles =
-    data.values
-      .map(item => {
-
-        const date =
-          new Date(
-            String(
-              item.datetime
+    result[i] =
+      avgLoss === 0
+        ? 100
+        : 100 -
+          (
+            100 /
+            (
+              1 +
+              (
+                avgGain /
+                avgLoss
+              )
             )
-              .replace(
-                " ",
-                "T"
-              ) +
-              "Z"
           );
 
-        return {
-
-          start:
-            Math.floor(
-              date.getTime() /
-              1000
-            ),
-
-          open:
-            Number(item.open),
-
-          high:
-            Number(item.high),
-
-          low:
-            Number(item.low),
-
-          close:
-            Number(item.close)
-        };
-      })
-      .filter(
-        candle =>
-          Number.isFinite(
-            candle.start
-          ) &&
-          Number.isFinite(
-            candle.open
-          ) &&
-          Number.isFinite(
-            candle.high
-          ) &&
-          Number.isFinite(
-            candle.low
-          ) &&
-          Number.isFinite(
-            candle.close
-          )
-      )
-      .reverse();
-
-  const nowSec =
-    Math.floor(
-      Date.now() / 1000
-    );
-
-  const currentM5Bucket =
-    candleBucket(
-      nowSec,
-      300
-    );
-
-  state.closedM5 =
-    candles
-      .filter(
-        candle =>
-          candle.start <
-          currentM5Bucket
-      )
-      .slice(
-        -MAX_CANDLES
-      );
-
-  const current =
-    candles.find(
-      candle =>
-        candle.start ===
-        currentM5Bucket
-    );
-
-  state.currentM5 =
-    current
-      ? { ...current }
-      : null;
-
-  state.closedM15 =
-    aggregateClosedM15(
-      state.closedM5,
-      nowSec
-    );
-
-  state.currentM15 =
-    buildCurrentM15(
-      state.closedM5,
-      state.currentM5,
-      nowSec
-    );
-
-  const latest =
-    state.currentM5 ||
-    state.closedM5[
-      state.closedM5.length - 1
-    ];
-
-  if (
-    latest
-  ) {
-
-    state.lastPrice =
-      formatPrice(
-        asset,
-        latest.close
-      );
   }
 
-  state.bootstrapped =
-    true;
+  return result;
 
-  console.log(
-    `${asset} BOOTSTRAP OK | M5 ${state.closedM5.length} | M15 ${state.closedM15.length}`
-  );
-
-  refreshSignal(asset);
 }
 
 
-/* =====================================================
-   LIVE M5
-===================================================== */
+// ======================================================
+// ATR
+// ======================================================
 
-function updateLiveM5(
-  state,
-  price,
-  timestampSec
+function atrSeries(
+  candles,
+  length
 ) {
 
-  const bucket =
-    candleBucket(
-      timestampSec,
-      300
-    );
+  const tr = [];
 
-  let current =
-    state.currentM5;
-
-  if (!current) {
-
-    state.currentM5 = {
-
-      start:
-        bucket,
-
-      open:
-        price,
-
-      high:
-        price,
-
-      low:
-        price,
-
-      close:
-        price
-    };
-
-    return false;
-  }
-
-  if (
-    bucket ===
-    current.start
+  for (
+    let i = 0;
+    i <
+      candles.length;
+    i++
   ) {
 
-    current.high =
+    const high =
+      n(
+        candles[i].high
+      );
+
+    const low =
+      n(
+        candles[i].low
+      );
+
+    if (
+      i === 0
+    ) {
+
+      tr.push(
+        high - low
+      );
+
+      continue;
+
+    }
+
+    const previousClose =
+      n(
+        candles[
+          i - 1
+        ].close
+      );
+
+    tr.push(
       Math.max(
-        current.high,
-        price
-      );
-
-    current.low =
-      Math.min(
-        current.low,
-        price
-      );
-
-    current.close =
-      price;
-
-    return false;
-  }
-
-  if (
-    bucket <
-    current.start
-  ) {
-
-    return false;
-  }
-
-  addClosedCandle(
-    state.closedM5,
-    current
-  );
-
-  state.currentM5 = {
-
-    start:
-      bucket,
-
-    open:
-      price,
-
-    high:
-      price,
-
-    low:
-      price,
-
-    close:
-      price
-  };
-
-  return true;
-}
-
-
-/* =====================================================
-   ANALYSIS
-===================================================== */
-
-function analyseTimeframe(
-  asset,
-  timeframe,
-  closedCandles,
-  currentCandle
-) {
-
-  const candles = [
-    ...closedCandles
-  ];
-
-  if (
-    currentCandle
-  ) {
-
-    candles.push({
-      ...currentCandle
-    });
-  }
-
-  if (
-    candles.length < 25
-  ) {
-
-    return {
-
-      asset,
-
-      timeframe,
-
-      status:
-        "WAIT",
-
-      confidence:
-        0,
-
-      score:
-        0,
-
-      reason:
-        "WARMING_UP",
-
-      bars:
-        candles.length
-    };
-  }
-
-  const recent =
-    candles.slice(-80);
-
-  const closes =
-    recent.map(
-      candle =>
-        candle.close
-    );
-
-  const last =
-    recent[
-      recent.length - 1
-    ];
-
-  const previous =
-    recent[
-      recent.length - 2
-    ];
-
-  const ema9 =
-    ema(
-      closes,
-      9
-    );
-
-  const ema21 =
-    ema(
-      closes,
-      21
-    );
-
-  const currentRsi =
-    rsi(
-      closes,
-      14
-    );
-
-  const currentAtr =
-    atr(
-      recent,
-      14
-    );
-
-  const momentum =
-    momentumPercent(
-      closes,
-      3
-    );
-
-  let score = 0;
-
-  if (
-    ema9 > ema21
-  ) {
-    score += 3;
-  }
-
-  if (
-    ema9 < ema21
-  ) {
-    score -= 3;
-  }
-
-  if (
-    last.close > ema9
-  ) {
-    score += 1;
-  }
-
-  if (
-    last.close < ema9
-  ) {
-    score -= 1;
-  }
-
-  if (
-    currentRsi >= 52 &&
-    currentRsi <= 72
-  ) {
-    score += 2;
-  }
-
-  if (
-    currentRsi <= 48 &&
-    currentRsi >= 28
-  ) {
-    score -= 2;
-  }
-
-  if (
-    momentum > 0.015
-  ) {
-    score += 2;
-  }
-
-  if (
-    momentum < -0.015
-  ) {
-    score -= 2;
-  }
-
-  if (
-    last.close >
-    last.open
-  ) {
-    score += 1;
-  }
-
-  if (
-    last.close <
-    last.open
-  ) {
-    score -= 1;
-  }
-
-  if (
-    last.close >
-    previous.close
-  ) {
-    score += 1;
-  }
-
-  if (
-    last.close <
-    previous.close
-  ) {
-    score -= 1;
-  }
-
-  let status =
-    "WAIT";
-
-  if (
-    score >= 4
-  ) {
-    status =
-      "BUY";
-  }
-
-  if (
-    score <= -4
-  ) {
-    status =
-      "SELL";
-  }
-
-  const confidence =
-    status === "WAIT"
-
-      ? Math.min(
-          67,
-          48 +
-          Math.abs(score) * 3
+        high - low,
+        Math.abs(
+          high -
+          previousClose
+        ),
+        Math.abs(
+          low -
+          previousClose
         )
+      )
+    );
 
-      : Math.min(
-          96,
-          55 +
-          Math.abs(score) * 5
-        );
+  }
 
-  return {
+  const result =
+    new Array(
+      candles.length
+    ).fill(null);
 
-    asset,
-    timeframe,
-    status,
-    score,
-    confidence,
+  if (
+    tr.length <
+    length
+  ) {
 
-    price:
-      formatPrice(
-        asset,
-        last.close
-      ),
+    return result;
 
-    ema9:
-      formatPrice(
-        asset,
-        ema9
-      ),
+  }
 
-    ema21:
-      formatPrice(
-        asset,
-        ema21
-      ),
+  let sum = 0;
 
-    rsi:
-      round(
-        currentRsi,
-        1
-      ),
+  for (
+    let i = 0;
+    i < length;
+    i++
+  ) {
 
-    atr:
-      formatPrice(
-        asset,
-        currentAtr
-      ),
+    sum += tr[i];
 
-    momentum:
-      round(
-        momentum,
-        4
-      ),
+  }
 
-    bars:
-      recent.length,
+  let previous =
+    sum / length;
 
-    updatedAt:
-      nowIso()
-  };
+  result[
+    length - 1
+  ] = previous;
+
+  for (
+    let i = length;
+    i <
+      tr.length;
+    i++
+  ) {
+
+    previous =
+      (
+        (
+          previous *
+          (
+            length - 1
+          )
+        ) +
+        tr[i]
+      ) /
+      length;
+
+    result[i] =
+      previous;
+
+  }
+
+  return result;
+
 }
 
 
-/* =====================================================
-   M5 + M15
-===================================================== */
-
-function combineSignals(
-  asset,
-  m5,
-  m15
-) {
-
-  let direction =
-    "WAIT";
-
-  let confidence =
-    0;
-
-  let reason =
-    "Waiting for confirmation";
-
-  if (
-    m5.status === "BUY" &&
-    m15.status === "BUY"
-  ) {
-
-    direction =
-      "BUY";
-
-    confidence =
-      Math.round(
-        m5.confidence *
-        0.6 +
-        m15.confidence *
-        0.4
-      );
-
-    reason =
-      "M5 + M15 BUY confirmation";
-  }
-
-  if (
-    m5.status === "SELL" &&
-    m15.status === "SELL"
-  ) {
-
-    direction =
-      "SELL";
-
-    confidence =
-      Math.round(
-        m5.confidence *
-        0.6 +
-        m15.confidence *
-        0.4
-      );
-
-    reason =
-      "M5 + M15 SELL confirmation";
-  }
-
-  if (
-    direction === "WAIT" &&
-    m5.status === "BUY" &&
-    m5.confidence >= 70 &&
-    m15.score >= -1
-  ) {
-
-    direction =
-      "BUY";
-
-    confidence =
-      Math.round(
-        m5.confidence *
-        0.75 +
-        Math.max(
-          55,
-          m15.confidence
-        ) *
-        0.25
-      );
-
-    reason =
-      "FAST M5 BUY + M15 not bearish";
-  }
-
-  if (
-    direction === "WAIT" &&
-    m5.status === "SELL" &&
-    m5.confidence >= 70 &&
-    m15.score <= 1
-  ) {
-
-    direction =
-      "SELL";
-
-    confidence =
-      Math.round(
-        m5.confidence *
-        0.75 +
-        Math.max(
-          55,
-          m15.confidence
-        ) *
-        0.25
-      );
-
-    reason =
-      "FAST M5 SELL + M15 not bullish";
-  }
-
-  if (
-    confidence <
-    MIN_CONFIDENCE
-  ) {
-
-    direction =
-      "WAIT";
-
-    reason =
-      "Confidence below minimum";
-  }
-
-  return {
-
-    asset,
-
-    label:
-      ASSETS[asset].label,
-
-    symbol:
-      ASSETS[asset].symbol,
-
-    direction,
-    confidence,
-    reason,
-
-    price:
-      m5.price,
-
-    M5:
-      m5,
-
-    M15:
-      m15,
-
-    updatedAt:
-      nowIso()
-  };
-}
-
-
-/* =====================================================
-   REFRESH
-===================================================== */
-
-function refreshSignal(asset) {
-
-  const state =
-    ensureState(asset);
-
-  const m5 =
-    analyseTimeframe(
-      asset,
-      "M5",
-      state.closedM5,
-      state.currentM5
-    );
-
-  const m15 =
-    analyseTimeframe(
-      asset,
-      "M15",
-      state.closedM15,
-      state.currentM15
-    );
-
-  const finalSignal =
-    combineSignals(
-      asset,
-      m5,
-      m15
-    );
-
-  signals.set(
-    asset,
-    finalSignal
-  );
-
-  return finalSignal;
-}
-
-
-/* =====================================================
-   ONESIGNAL
-===================================================== */
+// ======================================================
+// ONESIGNAL PUSH
+// ======================================================
 
 async function sendPush(
   title,
@@ -1671,30 +523,30 @@ async function sendPush(
   ) {
 
     console.log(
-      "OneSignal not configured"
+      "ONESIGNAL KEYS MISSING"
     );
 
-    return false;
+    return;
+
   }
 
   try {
 
     const response =
       await fetch(
-
         "https://api.onesignal.com/notifications",
-
         {
-          method:
-            "POST",
+
+          method: "POST",
 
           headers: {
 
             "Content-Type":
-              "application/json",
+              "application/json; charset=utf-8",
 
             "Authorization":
               `Key ${ONESIGNAL_API_KEY}`
+
           },
 
           body:
@@ -1703,259 +555,509 @@ async function sendPush(
               app_id:
                 ONESIGNAL_APP_ID,
 
+              target_channel:
+                "push",
+
               included_segments: [
                 "Subscribed Users"
               ],
 
               headings: {
+
                 en: title
+
               },
 
               contents: {
+
                 en: message
+
               },
 
               data
+
             })
+
         }
       );
 
-    const result =
-      await response
-        .json()
-        .catch(() => ({}));
-
-    if (
-      !response.ok
-    ) {
-
-      console.log(
-        "OneSignal error:",
-        result
-      );
-
-      return false;
-    }
+    const body =
+      await response.text();
 
     console.log(
-      "PUSH SENT:",
-      title
+      "ONESIGNAL:",
+      response.status,
+      body
     );
-
-    return true;
 
   } catch (error) {
 
     console.log(
-      "Push error:",
+      "PUSH ERROR:",
       error.message
     );
 
-    return false;
   }
+
 }
 
 
-/* =====================================================
-   LEVELS
-===================================================== */
+// ======================================================
+// TWELVE DATA
+// ======================================================
 
-function createTradeLevels(
-  asset,
-  signal
+async function getCandles() {
+
+  if (
+    !TWELVE_DATA_API_KEY
+  ) {
+
+    throw new Error(
+      "TWELVE_DATA_API_KEY missing"
+    );
+
+  }
+
+  const url =
+    new URL(
+      "https://api.twelvedata.com/time_series"
+    );
+
+  url.searchParams.set(
+    "symbol",
+    SYMBOL
+  );
+
+  url.searchParams.set(
+    "interval",
+    INTERVAL
+  );
+
+  url.searchParams.set(
+    "outputsize",
+    "200"
+  );
+
+  url.searchParams.set(
+    "order",
+    "asc"
+  );
+
+  url.searchParams.set(
+    "timezone",
+    "UTC"
+  );
+
+  url.searchParams.set(
+    "apikey",
+    TWELVE_DATA_API_KEY
+  );
+
+  const response =
+    await fetch(url);
+
+  const data =
+    await response.json();
+
+  if (
+    data.status ===
+    "error"
+  ) {
+
+    throw new Error(
+      data.message ||
+      "Twelve Data error"
+    );
+
+  }
+
+  if (
+    !Array.isArray(
+      data.values
+    )
+  ) {
+
+    throw new Error(
+      "No candle data"
+    );
+
+  }
+
+  return data.values;
+
+}
+
+
+// ======================================================
+// CLOSE TRADE
+// ======================================================
+
+async function closeTrade(
+  result,
+  message
+) {
+
+  const trade =
+    state.trade;
+
+  if (!trade) return;
+
+  trade.status =
+    result;
+
+  trade.closedAt =
+    new Date().toISOString();
+
+  state.history.unshift(
+    trade
+  );
+
+  state.history =
+    state.history.slice(
+      0,
+      100
+    );
+
+  state.trade = null;
+
+  saveState();
+
+  await sendPush(
+    `ADAMS GOLD • ${result}`,
+    message,
+    {
+      symbol:
+        "XAUUSD",
+
+      timeframe:
+        "M15",
+
+      result
+    }
+  );
+
+}
+
+
+// ======================================================
+// MANAGE OPEN TRADE
+// ======================================================
+
+async function manageTrade(
+  liveCandle
+) {
+
+  const trade =
+    state.trade;
+
+  if (!trade) return;
+
+  const high =
+    n(
+      liveCandle.high
+    );
+
+  const low =
+    n(
+      liveCandle.low
+    );
+
+
+  // ====================================================
+  // BUY
+  // ====================================================
+
+  if (
+    trade.direction ===
+    "BUY"
+  ) {
+
+    // STOP LOSS / BREAK EVEN
+
+    if (
+      low <=
+      trade.stop
+    ) {
+
+      if (
+        trade.tp1Hit
+      ) {
+
+        await closeTrade(
+          "BREAK EVEN",
+          `BUY XAUUSD M15 • Break Even hit at ${price(trade.entry)}`
+        );
+
+      } else {
+
+        await closeTrade(
+          "STOP LOSS",
+          `BUY XAUUSD M15 • Stop Loss hit at ${price(trade.stop)}`
+        );
+
+      }
+
+      return;
+
+    }
+
+
+    // TP1
+
+    if (
+      !trade.tp1Hit &&
+      high >=
+      trade.tp1
+    ) {
+
+      trade.tp1Hit =
+        true;
+
+      trade.stop =
+        trade.entry;
+
+      trade.status =
+        "TP1 HIT";
+
+      saveState();
+
+      await sendPush(
+        "ADAMS GOLD • TP1 ✅",
+        `BUY XAUUSD M15 • TP1 ${price(trade.tp1)} HIT`
+      );
+
+      await sendPush(
+        "ADAMS GOLD • BREAK EVEN 🛡️",
+        `Stop Loss moved to ENTRY ${price(trade.entry)}`
+      );
+
+    }
+
+
+    // TP2
+
+    if (
+      state.trade &&
+      !trade.tp2Hit &&
+      high >=
+      trade.tp2
+    ) {
+
+      trade.tp2Hit =
+        true;
+
+      trade.status =
+        "TP2 HIT";
+
+      saveState();
+
+      await sendPush(
+        "ADAMS GOLD • TP2 ✅",
+        `BUY XAUUSD M15 • TP2 ${price(trade.tp2)} HIT`
+      );
+
+    }
+
+
+    // TP3
+
+    if (
+      state.trade &&
+      high >=
+      trade.tp3
+    ) {
+
+      await closeTrade(
+        "TP3 WIN",
+        `BUY XAUUSD M15 • TP3 ${price(trade.tp3)} HIT • WIN ✅`
+      );
+
+      return;
+
+    }
+
+  }
+
+
+  // ====================================================
+  // SELL
+  // ====================================================
+
+  if (
+    trade.direction ===
+    "SELL"
+  ) {
+
+    // STOP LOSS / BREAK EVEN
+
+    if (
+      high >=
+      trade.stop
+    ) {
+
+      if (
+        trade.tp1Hit
+      ) {
+
+        await closeTrade(
+          "BREAK EVEN",
+          `SELL XAUUSD M15 • Break Even hit at ${price(trade.entry)}`
+        );
+
+      } else {
+
+        await closeTrade(
+          "STOP LOSS",
+          `SELL XAUUSD M15 • Stop Loss hit at ${price(trade.stop)}`
+        );
+
+      }
+
+      return;
+
+    }
+
+
+    // TP1
+
+    if (
+      !trade.tp1Hit &&
+      low <=
+      trade.tp1
+    ) {
+
+      trade.tp1Hit =
+        true;
+
+      trade.stop =
+        trade.entry;
+
+      trade.status =
+        "TP1 HIT";
+
+      saveState();
+
+      await sendPush(
+        "ADAMS GOLD • TP1 ✅",
+        `SELL XAUUSD M15 • TP1 ${price(trade.tp1)} HIT`
+      );
+
+      await sendPush(
+        "ADAMS GOLD • BREAK EVEN 🛡️",
+        `Stop Loss moved to ENTRY ${price(trade.entry)}`
+      );
+
+    }
+
+
+    // TP2
+
+    if (
+      state.trade &&
+      !trade.tp2Hit &&
+      low <=
+      trade.tp2
+    ) {
+
+      trade.tp2Hit =
+        true;
+
+      trade.status =
+        "TP2 HIT";
+
+      saveState();
+
+      await sendPush(
+        "ADAMS GOLD • TP2 ✅",
+        `SELL XAUUSD M15 • TP2 ${price(trade.tp2)} HIT`
+      );
+
+    }
+
+
+    // TP3
+
+    if (
+      state.trade &&
+      low <=
+      trade.tp3
+    ) {
+
+      await closeTrade(
+        "TP3 WIN",
+        `SELL XAUUSD M15 • TP3 ${price(trade.tp3)} HIT • WIN ✅`
+      );
+
+      return;
+
+    }
+
+  }
+
+}
+
+
+// ======================================================
+// OPEN BUY
+// ======================================================
+
+async function openBuy(
+  candle,
+  atrValue
 ) {
 
   const entry =
-    Number(
-      signal.price
+    n(
+      candle.close
     );
-
-  const atrValue =
-    Number(
-      signal.M5?.atr
-    );
-
-  if (
-    !Number.isFinite(entry) ||
-    !Number.isFinite(atrValue) ||
-    atrValue <= 0
-  ) {
-
-    return null;
-  }
-
-  if (
-    signal.direction === "BUY"
-  ) {
-
-    return {
-
-      entry:
-        formatPrice(
-          asset,
-          entry
-        ),
-
-      sl:
-        formatPrice(
-          asset,
-          entry -
-          atrValue * 1.15
-        ),
-
-      tp1:
-        formatPrice(
-          asset,
-          entry +
-          atrValue
-        ),
-
-      tp2:
-        formatPrice(
-          asset,
-          entry +
-          atrValue * 1.8
-        ),
-
-      tp3:
-        formatPrice(
-          asset,
-          entry +
-          atrValue * 2.6
-        )
-    };
-  }
-
-  if (
-    signal.direction === "SELL"
-  ) {
-
-    return {
-
-      entry:
-        formatPrice(
-          asset,
-          entry
-        ),
-
-      sl:
-        formatPrice(
-          asset,
-          entry +
-          atrValue * 1.15
-        ),
-
-      tp1:
-        formatPrice(
-          asset,
-          entry -
-          atrValue
-        ),
-
-      tp2:
-        formatPrice(
-          asset,
-          entry -
-          atrValue * 1.8
-        ),
-
-      tp3:
-        formatPrice(
-          asset,
-          entry -
-          atrValue * 2.6
-        )
-    };
-  }
-
-  return null;
-}
-
-
-/* =====================================================
-   OPEN TRADE
-===================================================== */
-
-async function maybeOpenTrade(
-  asset,
-  signal
-) {
-
-  if (
-    !signal ||
-    signal.direction === "WAIT"
-  ) {
-    return;
-  }
-
-  if (
-    openTrades.has(asset)
-  ) {
-    return;
-  }
-
-  if (
-    openTrades.size >=
-    MAX_OPEN_TRADES
-  ) {
-    return;
-  }
-
-  const lastTime =
-    lastSignalTimes.get(asset)
-    || 0;
-
-  if (
-    Date.now() -
-    lastTime <
-    SIGNAL_COOLDOWN_MS
-  ) {
-    return;
-  }
-
-  const levels =
-    createTradeLevels(
-      asset,
-      signal
-    );
-
-  if (!levels) {
-    return;
-  }
 
   const trade = {
 
-    id:
-      `${asset}-${Date.now()}`,
-
-    asset,
-
-    label:
-      ASSETS[asset].label,
-
     direction:
-      signal.direction,
+      "BUY",
 
-    confidence:
-      signal.confidence,
+    symbol:
+      "XAUUSD",
 
-    entry:
-      levels.entry,
+    timeframe:
+      "M15",
 
-    sl:
-      levels.sl,
+    entry,
 
-    originalSl:
-      levels.sl,
+    stop:
+      entry -
+      (
+        atrValue *
+        SL_ATR
+      ),
+
+    originalStop:
+      entry -
+      (
+        atrValue *
+        SL_ATR
+      ),
 
     tp1:
-      levels.tp1,
+      entry +
+      (
+        atrValue *
+        TP1_ATR
+      ),
 
     tp2:
-      levels.tp2,
+      entry +
+      (
+        atrValue *
+        TP2_ATR
+      ),
 
     tp3:
-      levels.tp3,
+      entry +
+      (
+        atrValue *
+        TP3_ATR
+      ),
 
     tp1Hit:
       false,
@@ -1963,1249 +1065,578 @@ async function maybeOpenTrade(
     tp2Hit:
       false,
 
-    tp3Hit:
+    status:
+      "OPEN",
+
+    signalCandle:
+      candle.datetime,
+
+    openedAt:
+      new Date()
+        .toISOString()
+
+  };
+
+  state.trade =
+    trade;
+
+  saveState();
+
+  await sendPush(
+    "🟢 ADAMS GOLD • BUY",
+    `XAUUSD M15
+ENTRY ${price(trade.entry)}
+STOP LOSS ${price(trade.stop)}
+TP1 ${price(trade.tp1)}
+TP2 ${price(trade.tp2)}
+TP3 ${price(trade.tp3)}`,
+    {
+      direction:
+        "BUY"
+    }
+  );
+
+}
+
+
+// ======================================================
+// OPEN SELL
+// ======================================================
+
+async function openSell(
+  candle,
+  atrValue
+) {
+
+  const entry =
+    n(
+      candle.close
+    );
+
+  const trade = {
+
+    direction:
+      "SELL",
+
+    symbol:
+      "XAUUSD",
+
+    timeframe:
+      "M15",
+
+    entry,
+
+    stop:
+      entry +
+      (
+        atrValue *
+        SL_ATR
+      ),
+
+    originalStop:
+      entry +
+      (
+        atrValue *
+        SL_ATR
+      ),
+
+    tp1:
+      entry -
+      (
+        atrValue *
+        TP1_ATR
+      ),
+
+    tp2:
+      entry -
+      (
+        atrValue *
+        TP2_ATR
+      ),
+
+    tp3:
+      entry -
+      (
+        atrValue *
+        TP3_ATR
+      ),
+
+    tp1Hit:
       false,
 
-    breakEven:
+    tp2Hit:
       false,
 
     status:
       "OPEN",
 
-    openedAt:
-      nowIso(),
+    signalCandle:
+      candle.datetime,
 
-    updatedAt:
-      nowIso()
+    openedAt:
+      new Date()
+        .toISOString()
+
   };
 
-  openTrades.set(
-    asset,
-    trade
-  );
+  state.trade =
+    trade;
 
-  lastSignalTimes.set(
-    asset,
-    Date.now()
-  );
-
-  saveRuntimeState();
+  saveState();
 
   await sendPush(
-
-    `${trade.label} ${trade.direction} ✅`,
-
-    `Entry ${trade.entry} | SL ${trade.sl} | TP1 ${trade.tp1} | TP2 ${trade.tp2} | TP3 ${trade.tp3} | Confidence ${trade.confidence}%`,
-
+    "🔴 ADAMS GOLD • SELL",
+    `XAUUSD M15
+ENTRY ${price(trade.entry)}
+STOP LOSS ${price(trade.stop)}
+TP1 ${price(trade.tp1)}
+TP2 ${price(trade.tp2)}
+TP3 ${price(trade.tp3)}`,
     {
-      event:
-        "NEW_SIGNAL",
-
-      asset,
-      trade
+      direction:
+        "SELL"
     }
   );
 
-  console.log(
-    "NEW TRADE",
-    asset,
-    trade.direction,
-    trade.entry
-  );
 }
 
 
-/* =====================================================
-   CLOSE
-===================================================== */
+// ======================================================
+// SCANNER
+// ======================================================
 
-async function closeTrade(
-  asset,
-  trade,
-  result,
-  price
-) {
+let scanning =
+  false;
 
-  trade.status =
-    result;
 
-  trade.exit =
-    formatPrice(
-      asset,
-      price
-    );
+async function scanMarket() {
 
-  trade.closedAt =
-    nowIso();
-
-  trade.updatedAt =
-    nowIso();
-
-  openTrades.delete(asset);
-
-  history.unshift({
-    ...trade
-  });
-
-  history =
-    history.slice(
-      0,
-      500
-    );
-
-  saveHistory();
-  saveRuntimeState();
-
-  await sendPush(
-
-    `${trade.label} ${result}`,
-
-    `${trade.direction} | Entry ${trade.entry} | Exit ${trade.exit}`,
-
-    {
-      event:
-        result,
-
-      asset,
-      trade
-    }
-  );
-
-  console.log(
-    "TRADE CLOSED",
-    asset,
-    result
-  );
-}
-
-
-/* =====================================================
-   TP / SL
-===================================================== */
-
-async function trackTrade(
-  asset,
-  currentPrice
-) {
-
-  const trade =
-    openTrades.get(asset);
-
-  if (!trade) {
-    return;
-  }
-
-  const price =
-    Number(currentPrice);
-
-  if (
-    !Number.isFinite(price)
-  ) {
-    return;
-  }
-
-  trade.updatedAt =
-    nowIso();
-
-
-  /* BUY */
-
-  if (
-    trade.direction === "BUY"
-  ) {
-
-    if (
-      !trade.tp1Hit &&
-      price >=
-      Number(trade.tp1)
-    ) {
-
-      trade.tp1Hit =
-        true;
-
-      trade.breakEven =
-        true;
-
-      trade.sl =
-        trade.entry;
-
-      trade.status =
-        "TP1";
-
-      saveRuntimeState();
-
-      await sendPush(
-
-        `${trade.label} TP1 ✅`,
-
-        `TP1 ${trade.tp1} hit. Move SL to ENTRY ${trade.entry}.`,
-
-        {
-          event:
-            "TP1",
-
-          asset,
-          trade
-        }
-      );
-    }
-
-    if (
-      !trade.tp2Hit &&
-      price >=
-      Number(trade.tp2)
-    ) {
-
-      trade.tp2Hit =
-        true;
-
-      trade.status =
-        "TP2";
-
-      saveRuntimeState();
-
-      await sendPush(
-
-        `${trade.label} TP2 ✅`,
-
-        `TP2 ${trade.tp2} hit.`,
-
-        {
-          event:
-            "TP2",
-
-          asset,
-          trade
-        }
-      );
-    }
-
-    if (
-      !trade.tp3Hit &&
-      price >=
-      Number(trade.tp3)
-    ) {
-
-      trade.tp3Hit =
-        true;
-
-      saveRuntimeState();
-
-      await sendPush(
-
-        `${trade.label} TP3 ✅`,
-
-        `TP3 ${trade.tp3} hit.`,
-
-        {
-          event:
-            "TP3",
-
-          asset,
-          trade
-        }
-      );
-
-      await closeTrade(
-        asset,
-        trade,
-        "WIN",
-        price
-      );
-
-      return;
-    }
-
-    if (
-      price <=
-      Number(trade.sl)
-    ) {
-
-      const result =
-        trade.breakEven
-          ? "BREAK-EVEN"
-          : "LOST";
-
-      await closeTrade(
-        asset,
-        trade,
-        result,
-        price
-      );
-    }
-  }
-
-
-  /* SELL */
-
-  if (
-    trade.direction === "SELL"
-  ) {
-
-    if (
-      !trade.tp1Hit &&
-      price <=
-      Number(trade.tp1)
-    ) {
-
-      trade.tp1Hit =
-        true;
-
-      trade.breakEven =
-        true;
-
-      trade.sl =
-        trade.entry;
-
-      trade.status =
-        "TP1";
-
-      saveRuntimeState();
-
-      await sendPush(
-
-        `${trade.label} TP1 ✅`,
-
-        `TP1 ${trade.tp1} hit. Move SL to ENTRY ${trade.entry}.`,
-
-        {
-          event:
-            "TP1",
-
-          asset,
-          trade
-        }
-      );
-    }
-
-    if (
-      !trade.tp2Hit &&
-      price <=
-      Number(trade.tp2)
-    ) {
-
-      trade.tp2Hit =
-        true;
-
-      trade.status =
-        "TP2";
-
-      saveRuntimeState();
-
-      await sendPush(
-
-        `${trade.label} TP2 ✅`,
-
-        `TP2 ${trade.tp2} hit.`,
-
-        {
-          event:
-            "TP2",
-
-          asset,
-          trade
-        }
-      );
-    }
-
-    if (
-      !trade.tp3Hit &&
-      price <=
-      Number(trade.tp3)
-    ) {
-
-      trade.tp3Hit =
-        true;
-
-      saveRuntimeState();
-
-      await sendPush(
-
-        `${trade.label} TP3 ✅`,
-
-        `TP3 ${trade.tp3} hit.`,
-
-        {
-          event:
-            "TP3",
-
-          asset,
-          trade
-        }
-      );
-
-      await closeTrade(
-        asset,
-        trade,
-        "WIN",
-        price
-      );
-
-      return;
-    }
-
-    if (
-      price >=
-      Number(trade.sl)
-    ) {
-
-      const result =
-        trade.breakEven
-          ? "BREAK-EVEN"
-          : "LOST";
-
-      await closeTrade(
-        asset,
-        trade,
-        result,
-        price
-      );
-    }
-  }
-}
-
-
-/* =====================================================
-   PRICE EVENT
-===================================================== */
-
-async function handlePrice(
-  message
-) {
-
-  const asset =
-    assetFromSymbol(
-      message.symbol
-    );
-
-  if (!asset) {
-    return;
-  }
-
-  const price =
-    Number(
-      message.price
-    );
-
-  const timestampSec =
-    Number(
-      message.timestamp
-    );
-
-  if (
-    !Number.isFinite(price) ||
-    !Number.isFinite(timestampSec)
-  ) {
+  if (scanning) {
 
     return;
+
   }
 
-  const state =
-    ensureState(asset);
+  scanning =
+    true;
 
-  state.lastPrice =
-    formatPrice(
-      asset,
-      price
-    );
+  try {
 
-  state.lastTickAt =
-    new Date(
-      timestampSec *
-      1000
-    ).toISOString();
+    const allCandles =
+      await getCandles();
 
-  wsLastEvent =
-    nowIso();
+    if (
+      allCandles.length <
+      60
+    ) {
 
-  const newM5 =
-    updateLiveM5(
-      state,
-      price,
-      timestampSec
-    );
-
-  if (
-    newM5
-  ) {
-
-    state.closedM15 =
-      aggregateClosedM15(
-        state.closedM5,
-        timestampSec
-      );
-  }
-
-  state.currentM15 =
-    buildCurrentM15(
-      state.closedM5,
-      state.currentM5,
-      timestampSec
-    );
-
-  const signal =
-    refreshSignal(asset);
-
-  await trackTrade(
-    asset,
-    price
-  );
-
-  await maybeOpenTrade(
-    asset,
-    signal
-  );
-}
-
-
-/* =====================================================
-   WEBSOCKET
-===================================================== */
-
-function scheduleReconnect() {
-
-  if (
-    shuttingDown ||
-    reconnectTimer
-  ) {
-
-    return;
-  }
-
-  reconnectAttempt += 1;
-
-  const waitMs =
-    Math.min(
-
-      30000,
-
-      1000 *
-      2 **
-      Math.min(
-        reconnectAttempt - 1,
-        5
-      )
-    );
-
-  reconnectTimer =
-    setTimeout(
-      () => {
-
-        reconnectTimer =
-          null;
-
-        connectWebSocket();
-
-      },
-      waitMs
-    );
-}
-
-
-function connectWebSocket() {
-
-  if (
-    !TWELVE_DATA_API_KEY
-  ) {
-
-    console.log(
-      "TWELVE DATA KEY MISSING"
-    );
-
-    return;
-  }
-
-  if (
-    ws &&
-    (
-      ws.readyState ===
-        WebSocket.OPEN ||
-      ws.readyState ===
-        WebSocket.CONNECTING
-    )
-  ) {
-
-    return;
-  }
-
-  const url =
-    `wss://ws.twelvedata.com/v1/quotes/price?apikey=${encodeURIComponent(
-      TWELVE_DATA_API_KEY
-    )}`;
-
-  console.log(
-    "Connecting Twelve Data WebSocket..."
-  );
-
-  ws =
-    new WebSocket(url);
-
-  ws.on(
-    "open",
-    () => {
-
-      wsConnected =
-        true;
-
-      reconnectAttempt =
-        0;
-
-      console.log(
-        "TWELVE DATA WEBSOCKET CONNECTED"
+      throw new Error(
+        "Not enough candles"
       );
 
-      ws.send(
-        JSON.stringify({
-
-          action:
-            "subscribe",
-
-          params: {
-
-            symbols:
-              Object
-                .values(ASSETS)
-                .map(
-                  x => x.symbol
-                )
-                .join(",")
-          }
-        })
-      );
     }
-  );
 
-  ws.on(
-    "message",
-    raw => {
 
-      let message;
+    // --------------------------------------------------
+    // LIVE CANDLE
+    // --------------------------------------------------
 
-      try {
+    const liveCandle =
+      allCandles[
+        allCandles.length - 1
+      ];
 
-        message =
-          JSON.parse(
-            raw.toString()
+
+    // --------------------------------------------------
+    // FIND CLOSED M15 CANDLES
+    // --------------------------------------------------
+
+    const now =
+      Date.now();
+
+    const closedCandles =
+      allCandles.filter(
+        candle => {
+
+          const openTime =
+            parseTime(
+              candle.datetime
+            );
+
+          const closeTime =
+            openTime +
+            (
+              15 *
+              60 *
+              1000
+            );
+
+          return (
+            closeTime <= now
           );
 
-      } catch {
-
-        return;
-      }
-
-      if (
-        message.event ===
-        "price"
-      ) {
-
-        handlePrice(
-          message
-        ).catch(
-          error => {
-
-            console.log(
-              "PRICE ERROR:",
-              error.message
-            );
-          }
-        );
-
-        return;
-      }
-
-      console.log(
-        "WS:",
-        JSON.stringify(
-          message
-        )
-      );
-    }
-  );
-
-  ws.on(
-    "error",
-    error => {
-
-      console.log(
-        "WEBSOCKET ERROR:",
-        error.message
-      );
-    }
-  );
-
-  ws.on(
-    "close",
-    () => {
-
-      wsConnected =
-        false;
-
-      ws =
-        null;
-
-      console.log(
-        "WEBSOCKET CLOSED"
+        }
       );
 
-      scheduleReconnect();
+
+    if (
+      closedCandles.length <
+      60
+    ) {
+
+      throw new Error(
+        "Not enough closed candles"
+      );
+
     }
-  );
+
+
+    // --------------------------------------------------
+    // MANAGE CURRENT TRADE
+    // --------------------------------------------------
+
+    if (
+      state.trade
+    ) {
+
+      await manageTrade(
+        liveCandle
+      );
+
+    }
+
+
+    // Only one trade at a time
+
+    if (
+      state.trade
+    ) {
+
+      return;
+
+    }
+
+
+    // --------------------------------------------------
+    // CALCULATIONS
+    // --------------------------------------------------
+
+    const closes =
+      closedCandles.map(
+        candle =>
+          n(
+            candle.close
+          )
+      );
+
+    const ema9 =
+      emaSeries(
+        closes,
+        EMA_FAST
+      );
+
+    const ema21 =
+      emaSeries(
+        closes,
+        EMA_SLOW
+      );
+
+    const ema50 =
+      emaSeries(
+        closes,
+        EMA_TREND
+      );
+
+    const rsi =
+      rsiSeries(
+        closes,
+        RSI_LENGTH
+      );
+
+    const atr =
+      atrSeries(
+        closedCandles,
+        ATR_LENGTH
+      );
+
+
+    const i =
+      closedCandles.length -
+      1;
+
+    const previous =
+      i - 1;
+
+    const candle =
+      closedCandles[i];
+
+
+    // --------------------------------------------------
+    // DO NOT PROCESS SAME CLOSED CANDLE TWICE
+    // --------------------------------------------------
+
+    if (
+      state.lastSignalCandle ===
+      candle.datetime
+    ) {
+
+      return;
+
+    }
+
+
+    state.lastSignalCandle =
+      candle.datetime;
+
+    saveState();
+
+
+    // --------------------------------------------------
+    // BUY LOGIC
+    // --------------------------------------------------
+
+    const buyCross =
+
+      ema9[previous] <=
+        ema21[previous] &&
+
+      ema9[i] >
+        ema21[i];
+
+
+    const buySignal =
+
+      buyCross &&
+
+      closes[i] >
+        ema50[i] &&
+
+      rsi[i] >
+        50;
+
+
+    // --------------------------------------------------
+    // SELL LOGIC
+    // --------------------------------------------------
+
+    const sellCross =
+
+      ema9[previous] >=
+        ema21[previous] &&
+
+      ema9[i] <
+        ema21[i];
+
+
+    const sellSignal =
+
+      sellCross &&
+
+      closes[i] <
+        ema50[i] &&
+
+      rsi[i] <
+        50;
+
+
+    console.log(
+      "M15:",
+      candle.datetime,
+      "Close:",
+      closes[i],
+      "RSI:",
+      rsi[i]?.toFixed(2),
+      "BUY:",
+      buySignal,
+      "SELL:",
+      sellSignal
+    );
+
+
+    // --------------------------------------------------
+    // OPEN SIGNAL
+    // --------------------------------------------------
+
+    if (
+      buySignal
+    ) {
+
+      await openBuy(
+        candle,
+        atr[i]
+      );
+
+    }
+
+
+    if (
+      sellSignal
+    ) {
+
+      await openSell(
+        candle,
+        atr[i]
+      );
+
+    }
+
+  } catch (error) {
+
+    console.log(
+      "SCAN ERROR:",
+      error.message
+    );
+
+  } finally {
+
+    scanning =
+      false;
+
+  }
+
 }
 
 
-/* =====================================================
-   STATS
-===================================================== */
-
-function calculateStats(items) {
-
-  const wins =
-    items.filter(
-      x =>
-        x.status === "WIN"
-    ).length;
-
-  const losses =
-    items.filter(
-      x =>
-        x.status === "LOST"
-    ).length;
-
-  const breakEven =
-    items.filter(
-      x =>
-        x.status ===
-        "BREAK-EVEN"
-    ).length;
-
-  const completed =
-    wins +
-    losses;
-
-  const winRate =
-    completed > 0
-
-      ? round(
-          wins /
-          completed *
-          100,
-          1
-        )
-
-      : 0;
-
-  return {
-
-    wins,
-    losses,
-    breakEven,
-    winRate,
-
-    total:
-      items.length
-  };
-}
-
-
-function getStats() {
-
-  const global =
-    calculateStats(
-      history
-    );
-
-  const gold =
-    calculateStats(
-      history.filter(
-        x =>
-          x.asset ===
-          "XAUUSD"
-      )
-    );
-
-  const bitcoin =
-    calculateStats(
-      history.filter(
-        x =>
-          x.asset ===
-          "BTCUSD"
-      )
-    );
-
-  return {
-
-    wins:
-      global.wins,
-
-    losses:
-      global.losses,
-
-    breakEven:
-      global.breakEven,
-
-    winRate:
-      global.winRate,
-
-    totalHistory:
-      history.length,
-
-    openTrades:
-      openTrades.size,
-
-    maxOpenTrades:
-      MAX_OPEN_TRADES,
-
-    XAUUSD:
-      gold,
-
-    BTCUSD:
-      bitcoin
-  };
-}
-
-
-/* =====================================================
-   ROUTES
-===================================================== */
+// ======================================================
+// API
+// ======================================================
 
 app.get(
   "/",
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
 
     res.json({
 
       app:
-        "BIT ADAMS SERVER",
-
-      version:
-        "8.7 LIVE",
-
-      mode:
-        "FAST M5 + M15 WEBSOCKET",
-
-      minConfidence:
-        MIN_CONFIDENCE,
-
-      websocketConnected:
-        wsConnected,
-
-      lastEvent:
-        wsLastEvent,
-
-      openTrades:
-        openTrades.size,
-
-      oneSignal:
-        ONESIGNAL_APP_ID &&
-        ONESIGNAL_API_KEY
-          ? "configured"
-          : "missing",
+        "ADAMS GOLD",
 
       status:
-        "online"
+        "ONLINE",
+
+      symbol:
+        "XAUUSD",
+
+      timeframe:
+        "M15",
+
+      scanner:
+        `${SCAN_SECONDS}s`,
+
+      trade:
+        state.trade
+
     });
+
   }
 );
 
 
 app.get(
   "/health",
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
 
     res.json({
 
-      ok:
+      ok: true,
+
+      time:
+        new Date()
+          .toISOString()
+
+    });
+
+  }
+);
+
+
+app.get(
+  "/state",
+  (
+    req,
+    res
+  ) => {
+
+    res.json(
+      state
+    );
+
+  }
+);
+
+
+// ======================================================
+// TEST NOTIFICATION
+// Open:
+// https://YOUR-RENDER-URL/test-push?key=YOUR_TEST_KEY
+// ======================================================
+
+app.get(
+  "/test-push",
+  async (
+    req,
+    res
+  ) => {
+
+    if (
+      !TEST_KEY ||
+      req.query.key !==
+        TEST_KEY
+    ) {
+
+      return res
+        .status(401)
+        .json({
+          error:
+            "Unauthorized"
+        });
+
+    }
+
+    await sendPush(
+      "✅ ADAMS GOLD",
+      "Notifications are working."
+    );
+
+    res.json({
+
+      success:
         true,
 
-      version:
-        "8.7 LIVE",
+      message:
+        "Test notification sent"
 
-      websocketConnected:
-        wsConnected,
-
-      lastEvent:
-        wsLastEvent,
-
-      timestamp:
-        nowIso()
     });
+
   }
 );
 
 
-app.get(
-  "/api/signals",
-  (req, res) => {
-
-    const result = {};
-
-    for (
-      const asset
-      of Object.keys(ASSETS)
-    ) {
-
-      const state =
-        ensureState(asset);
-
-      result[asset] =
-        signals.get(asset)
-        || {
-
-          asset,
-
-          label:
-            ASSETS[asset].label,
-
-          symbol:
-            ASSETS[asset].symbol,
-
-          direction:
-            "WAIT",
-
-          confidence:
-            0,
-
-          reason:
-            "WARMING_UP",
-
-          price:
-            state.lastPrice,
-
-          M5: {
-            status:
-              "WAIT"
-          },
-
-          M15: {
-            status:
-              "WAIT"
-          }
-        };
-    }
-
-    res.json({
-
-      ...result,
-
-      openTrades:
-        openTrades.size,
-
-      maxOpenTrades:
-        MAX_OPEN_TRADES,
-
-      websocketConnected:
-        wsConnected,
-
-      lastEvent:
-        wsLastEvent
-    });
-  }
-);
-
-
-app.get(
-  "/api/prices",
-  (req, res) => {
-
-    const result = {};
-
-    for (
-      const asset
-      of Object.keys(ASSETS)
-    ) {
-
-      const state =
-        ensureState(asset);
-
-      result[asset] = {
-
-        price:
-          state.lastPrice,
-
-        lastTickAt:
-          state.lastTickAt
-      };
-    }
-
-    res.json(result);
-  }
-);
-
-
-app.get(
-  "/api/open-trades",
-  (req, res) => {
-
-    res.json(
-      Array.from(
-        openTrades.values()
-      )
-    );
-  }
-);
-
-
-app.get(
-  "/api/history",
-  (req, res) => {
-
-    res.json({
-
-      stats:
-        getStats(),
-
-      history
-    });
-  }
-);
-
-
-app.get(
-  "/api/stats",
-  (req, res) => {
-
-    res.json(
-      getStats()
-    );
-  }
-);
-
-
-app.get(
-  "/api/debug",
-  (req, res) => {
-
-    const result = {};
-
-    for (
-      const asset
-      of Object.keys(ASSETS)
-    ) {
-
-      const state =
-        ensureState(asset);
-
-      result[asset] = {
-
-        lastPrice:
-          state.lastPrice,
-
-        lastTickAt:
-          state.lastTickAt,
-
-        closedM5:
-          state.closedM5.length,
-
-        closedM15:
-          state.closedM15.length,
-
-        currentM5:
-          state.currentM5,
-
-        currentM15:
-          state.currentM15,
-
-        signal:
-          signals.get(asset)
-          || null,
-
-        openTrade:
-          openTrades.get(asset)
-          || null
-      };
-    }
-
-    res.json({
-
-      version:
-        "8.7 LIVE",
-
-      websocketConnected:
-        wsConnected,
-
-      lastEvent:
-        wsLastEvent,
-
-      data:
-        result
-    });
-  }
-);
-
-
-/* =====================================================
-   TEST NOTIFICATION
-===================================================== */
-
-async function testNotification(
-  req,
-  res
-) {
-
-  const success =
-    await sendPush(
-
-      "BIT ADAMS ✅",
-
-      "Notifications are working.",
-
-      {
-        event:
-          "TEST"
-      }
-    );
-
-  res.json({
-
-    success,
-
-    oneSignal:
-      ONESIGNAL_APP_ID &&
-      ONESIGNAL_API_KEY
-        ? "configured"
-        : "missing"
-  });
-}
-
-app.get(
-  "/api/test-notification",
-  testNotification
-);
-
-app.post(
-  "/api/test-notification",
-  testNotification
-);
-
-
-/* =====================================================
-   START
-===================================================== */
+// ======================================================
+// START
+// ======================================================
 
 app.listen(
   PORT,
-  async () => {
-
-    loadHistory();
-    loadRuntimeState();
+  () => {
 
     console.log(
-      "===================================="
+      `ADAMS GOLD running on port ${PORT}`
     );
 
-    console.log(
-      `BIT ADAMS v8.7 LIVE PORT ${PORT}`
-    );
-
-    console.log(
-      `MIN CONFIDENCE ${MIN_CONFIDENCE}%`
-    );
-
-    console.log(
-      "FAST M5 + M15"
-    );
-
-    console.log(
-      "TP1 => SL TO ENTRY"
-    );
-
-    console.log(
-      TWELVE_DATA_API_KEY
-        ? "TWELVE DATA READY"
-        : "TWELVE DATA KEY MISSING"
-    );
-
-    console.log(
-      ONESIGNAL_APP_ID &&
-      ONESIGNAL_API_KEY
-        ? "ONESIGNAL READY"
-        : "ONESIGNAL MISSING"
-    );
-
-    console.log(
-      "===================================="
-    );
-
-    try {
-
-      await bootstrapAsset(
-        "XAUUSD"
-      );
-
-    } catch (error) {
-
-      console.log(
-        "GOLD BOOTSTRAP WARNING:",
-        error.message
-      );
-    }
-
-    await sleep(1200);
-
-    try {
-
-      await bootstrapAsset(
-        "BTCUSD"
-      );
-
-    } catch (error) {
-
-      console.log(
-        "BITCOIN BOOTSTRAP WARNING:",
-        error.message
-      );
-    }
-
-    connectWebSocket();
   }
 );
 
 
-/* =====================================================
-   SHUTDOWN
-===================================================== */
+scanMarket();
 
-function shutdown() {
-
-  shuttingDown =
-    true;
-
-  saveHistory();
-  saveRuntimeState();
-
-  if (
-    reconnectTimer
-  ) {
-
-    clearTimeout(
-      reconnectTimer
-    );
-  }
-
-  try {
-
-    if (
-      ws?.readyState ===
-      WebSocket.OPEN
-    ) {
-
-      ws.close(
-        1000,
-        "server shutdown"
-      );
-    }
-
-  } catch {}
-
-  process.exit(0);
-}
-
-process.on(
-  "SIGTERM",
-  shutdown
-);
-
-process.on(
-  "SIGINT",
-  shutdown
+setInterval(
+  scanMarket,
+  SCAN_SECONDS *
+    1000
 );
