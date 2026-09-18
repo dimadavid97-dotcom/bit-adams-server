@@ -1,20 +1,16 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import fs from "fs";
 
 dotenv.config();
 
 const app = express();
 
-app.use(cors());
-app.use(express.json());
+/* =====================================================
+   SETTINGS
+===================================================== */
 
-const PORT =
-  Number(process.env.PORT || 10000);
-
-const TWELVE_DATA_API_KEY =
-  process.env.TWELVE_DATA_API_KEY || "";
+const PORT = Number(process.env.PORT || 10000);
 
 const ONESIGNAL_APP_ID =
   process.env.ONESIGNAL_APP_ID || "";
@@ -22,1511 +18,515 @@ const ONESIGNAL_APP_ID =
 const ONESIGNAL_API_KEY =
   process.env.ONESIGNAL_API_KEY || "";
 
-const TEST_KEY =
-  process.env.TEST_KEY || "";
+// OPTIONAL
+// Dacă mai târziu pui WEBHOOK_SECRET în Render,
+// TradingView trebuie să trimită același secret.
+const WEBHOOK_SECRET =
+  process.env.WEBHOOK_SECRET || "";
 
-const SCAN_SECONDS =
-  Math.max(
-    60,
-    Number(process.env.SCAN_SECONDS || 60)
+
+/* =====================================================
+   MIDDLEWARE
+===================================================== */
+
+app.use(cors());
+
+app.use(
+  express.json({
+    limit: "100kb"
+  })
+);
+
+app.use(
+  express.text({
+    type: [
+      "text/plain",
+      "application/text"
+    ],
+    limit: "100kb"
+  })
+);
+
+
+/* =====================================================
+   HELPERS
+===================================================== */
+
+function clean(value) {
+
+  if (
+    value === undefined ||
+    value === null
+  ) {
+    return "";
+  }
+
+  return String(value).trim();
+}
+
+
+function normalizePayload(body) {
+
+  if (!body) {
+    return {};
+  }
+
+  if (typeof body === "object") {
+    return body;
+  }
+
+  if (typeof body === "string") {
+
+    const text = body.trim();
+
+    if (!text) {
+      return {};
+    }
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      return {
+        message: text
+      };
+    }
+
+  }
+
+  return {};
+}
+
+
+function detectEvent(payload) {
+
+  const raw =
+    clean(
+      payload.event ||
+      payload.action ||
+      payload.signal ||
+      payload.type ||
+      payload.side ||
+      payload.status ||
+      payload.message
+    ).toUpperCase();
+
+  if (
+    raw.includes("BREAK EVEN") ||
+    raw.includes("BREAK-EVEN") ||
+    raw.includes("BREAKEVEN") ||
+    raw === "BE"
+  ) {
+    return "BREAK_EVEN";
+  }
+
+  if (
+    raw.includes("STOP LOSS") ||
+    raw.includes("STOP-LOSS") ||
+    raw.includes("STOPLOSS") ||
+    raw === "SL" ||
+    raw.includes(" SL ")
+  ) {
+    return "SL";
+  }
+
+  if (raw.includes("TP3")) {
+    return "TP3";
+  }
+
+  if (raw.includes("TP2")) {
+    return "TP2";
+  }
+
+  if (raw.includes("TP1")) {
+    return "TP1";
+  }
+
+  if (
+    raw.includes("WIN") ||
+    raw.includes("PROFIT")
+  ) {
+    return "WIN";
+  }
+
+  if (
+    raw.includes("BUY") ||
+    raw.includes("LONG")
+  ) {
+    return "BUY";
+  }
+
+  if (
+    raw.includes("SELL") ||
+    raw.includes("SHORT")
+  ) {
+    return "SELL";
+  }
+
+  return "";
+}
+
+
+function normalizeSymbol(value) {
+
+  const s =
+    clean(value)
+      .toUpperCase()
+      .replace("OANDA:", "")
+      .replace("FOREXCOM:", "")
+      .replace("BINANCE:", "")
+      .replace("TVC:", "")
+      .replace("/", "");
+
+  if (
+    s.includes("XAUUSD") ||
+    s === "GOLD"
+  ) {
+    return "XAUUSD";
+  }
+
+  if (
+    s.includes("BTCUSD") ||
+    s.includes("BTCUSDT") ||
+    s === "BITCOIN"
+  ) {
+    return "BTCUSD";
+  }
+
+  return s || "MARKET";
+}
+
+
+function symbolLabel(symbol) {
+
+  if (symbol === "XAUUSD") {
+    return "GOLD";
+  }
+
+  if (symbol === "BTCUSD") {
+    return "BITCOIN";
+  }
+
+  return symbol;
+}
+
+
+function getTitle(event, symbol) {
+
+  const name = symbolLabel(symbol);
+
+  switch (event) {
+
+    case "BUY":
+      return `🟢 BUY ${name}`;
+
+    case "SELL":
+      return `🔴 SELL ${name}`;
+
+    case "TP1":
+      return `✅ TP1 HIT • ${name}`;
+
+    case "TP2":
+      return `✅ TP2 HIT • ${name}`;
+
+    case "TP3":
+      return `🏆 TP3 / WIN • ${name}`;
+
+    case "WIN":
+      return `🏆 WIN • ${name}`;
+
+    case "SL":
+      return `⛔ STOP LOSS • ${name}`;
+
+    case "BREAK_EVEN":
+      return `🟡 BREAK-EVEN • ${name}`;
+
+    default:
+      return `BIT ADAMS • ${name}`;
+  }
+
+}
+
+
+function addLine(lines, label, value) {
+
+  const v = clean(value);
+
+  if (v) {
+    lines.push(`${label}: ${v}`);
+  }
+
+}
+
+
+function buildMessage(
+  event,
+  symbol,
+  payload
+) {
+
+  const lines = [];
+
+  const name =
+    symbolLabel(symbol);
+
+  const timeframe =
+    clean(
+      payload.timeframe ||
+      payload.tf ||
+      payload.interval
+    );
+
+  lines.push(
+    `${name}${timeframe ? " • " + timeframe : ""}`
   );
 
-const STATE_FILE = "./adams-state.json";
-
-
-// ======================================================
-// SETTINGS
-// ======================================================
-
-const SYMBOL = "XAU/USD";
-
-const INTERVAL = "15min";
-
-const EMA_FAST = 9;
-const EMA_SLOW = 21;
-const EMA_TREND = 50;
-
-const RSI_LENGTH = 14;
-const ATR_LENGTH = 14;
-
-const SL_ATR = 1.30;
-
-const TP1_ATR = 1.00;
-const TP2_ATR = 2.00;
-const TP3_ATR = 3.00;
-
-
-// ======================================================
-// STATE
-// ======================================================
-
-let state = {
-
-  lastSignalCandle: null,
-
-  trade: null,
-
-  history: []
-
-};
-
-
-function loadState() {
-
-  try {
-
-    if (
-      fs.existsSync(
-        STATE_FILE
-      )
-    ) {
-
-      const data =
-        fs.readFileSync(
-          STATE_FILE,
-          "utf8"
-        );
-
-      state =
-        JSON.parse(data);
-
-    }
-
-  } catch (error) {
-
-    console.log(
-      "STATE LOAD ERROR:",
-      error.message
-    );
-
+  if (event === "BUY") {
+    lines.push("🟢 SIGNAL: BUY");
   }
 
+  if (event === "SELL") {
+    lines.push("🔴 SIGNAL: SELL");
+  }
+
+  if (event === "TP1") {
+    lines.push("✅ TAKE PROFIT 1 HIT");
+  }
+
+  if (event === "TP2") {
+    lines.push("✅ TAKE PROFIT 2 HIT");
+  }
+
+  if (event === "TP3") {
+    lines.push("🏆 TAKE PROFIT 3 HIT");
+    lines.push("TRADE WIN");
+  }
+
+  if (event === "WIN") {
+    lines.push("🏆 TRADE WIN");
+  }
+
+  if (event === "SL") {
+    lines.push("⛔ STOP LOSS HIT");
+  }
+
+  if (event === "BREAK_EVEN") {
+    lines.push("🟡 BREAK-EVEN");
+    lines.push("SL moved to ENTRY");
+  }
+
+
+  addLine(
+    lines,
+    "ENTRY",
+    payload.entry ||
+    payload.entryPrice
+  );
+
+  addLine(
+    lines,
+    "SL",
+    payload.sl ||
+    payload.stoploss ||
+    payload.stopLoss
+  );
+
+  addLine(
+    lines,
+    "TP1",
+    payload.tp1
+  );
+
+  addLine(
+    lines,
+    "TP2",
+    payload.tp2
+  );
+
+  addLine(
+    lines,
+    "TP3",
+    payload.tp3
+  );
+
+  addLine(
+    lines,
+    "PRICE",
+    payload.price ||
+    payload.close
+  );
+
+
+  return lines.join("\n");
 }
 
 
-function saveState() {
-
-  try {
-
-    fs.writeFileSync(
-      STATE_FILE,
-      JSON.stringify(
-        state,
-        null,
-        2
-      )
-    );
-
-  } catch (error) {
-
-    console.log(
-      "STATE SAVE ERROR:",
-      error.message
-    );
-
-  }
-
-}
-
-
-loadState();
-
-
-// ======================================================
-// HELPERS
-// ======================================================
-
-function n(value) {
-
-  return Number(value);
-
-}
-
-
-function price(value) {
-
-  return Number(value).toFixed(3);
-
-}
-
-
-function parseTime(datetime) {
-
-  if (!datetime) return 0;
-
-  const iso =
-    datetime
-      .replace(
-        " ",
-        "T"
-      ) + "Z";
-
-  return new Date(iso).getTime();
-
-}
-
-
-// ======================================================
-// EMA
-// ======================================================
-
-function emaSeries(
-  values,
-  length
-) {
-
-  const result =
-    new Array(
-      values.length
-    ).fill(null);
-
-  if (
-    values.length <
-    length
-  ) {
-
-    return result;
-
-  }
-
-  let sum = 0;
-
-  for (
-    let i = 0;
-    i < length;
-    i++
-  ) {
-
-    sum += values[i];
-
-  }
-
-  let previous =
-    sum / length;
-
-  result[
-    length - 1
-  ] = previous;
-
-  const multiplier =
-    2 / (length + 1);
-
-  for (
-    let i = length;
-    i < values.length;
-    i++
-  ) {
-
-    previous =
-      (
-        values[i] *
-        multiplier
-      ) +
-      (
-        previous *
-        (
-          1 -
-          multiplier
-        )
-      );
-
-    result[i] =
-      previous;
-
-  }
-
-  return result;
-
-}
-
-
-// ======================================================
-// RSI
-// ======================================================
-
-function rsiSeries(
-  values,
-  length
-) {
-
-  const result =
-    new Array(
-      values.length
-    ).fill(null);
-
-  if (
-    values.length <=
-    length
-  ) {
-
-    return result;
-
-  }
-
-  let gains = 0;
-  let losses = 0;
-
-  for (
-    let i = 1;
-    i <= length;
-    i++
-  ) {
-
-    const change =
-      values[i] -
-      values[i - 1];
-
-    if (
-      change >= 0
-    ) {
-
-      gains += change;
-
-    } else {
-
-      losses +=
-        Math.abs(change);
-
-    }
-
-  }
-
-  let avgGain =
-    gains / length;
-
-  let avgLoss =
-    losses / length;
-
-  result[length] =
-    avgLoss === 0
-      ? 100
-      : 100 -
-        (
-          100 /
-          (
-            1 +
-            (
-              avgGain /
-              avgLoss
-            )
-          )
-        );
-
-  for (
-    let i =
-      length + 1;
-    i <
-      values.length;
-    i++
-  ) {
-
-    const change =
-      values[i] -
-      values[i - 1];
-
-    const gain =
-      Math.max(
-        change,
-        0
-      );
-
-    const loss =
-      Math.max(
-        -change,
-        0
-      );
-
-    avgGain =
-      (
-        (
-          avgGain *
-          (
-            length - 1
-          )
-        ) +
-        gain
-      ) /
-      length;
-
-    avgLoss =
-      (
-        (
-          avgLoss *
-          (
-            length - 1
-          )
-        ) +
-        loss
-      ) /
-      length;
-
-    result[i] =
-      avgLoss === 0
-        ? 100
-        : 100 -
-          (
-            100 /
-            (
-              1 +
-              (
-                avgGain /
-                avgLoss
-              )
-            )
-          );
-
-  }
-
-  return result;
-
-}
-
-
-// ======================================================
-// ATR
-// ======================================================
-
-function atrSeries(
-  candles,
-  length
-) {
-
-  const tr = [];
-
-  for (
-    let i = 0;
-    i <
-      candles.length;
-    i++
-  ) {
-
-    const high =
-      n(
-        candles[i].high
-      );
-
-    const low =
-      n(
-        candles[i].low
-      );
-
-    if (
-      i === 0
-    ) {
-
-      tr.push(
-        high - low
-      );
-
-      continue;
-
-    }
-
-    const previousClose =
-      n(
-        candles[
-          i - 1
-        ].close
-      );
-
-    tr.push(
-      Math.max(
-        high - low,
-        Math.abs(
-          high -
-          previousClose
-        ),
-        Math.abs(
-          low -
-          previousClose
-        )
-      )
-    );
-
-  }
-
-  const result =
-    new Array(
-      candles.length
-    ).fill(null);
-
-  if (
-    tr.length <
-    length
-  ) {
-
-    return result;
-
-  }
-
-  let sum = 0;
-
-  for (
-    let i = 0;
-    i < length;
-    i++
-  ) {
-
-    sum += tr[i];
-
-  }
-
-  let previous =
-    sum / length;
-
-  result[
-    length - 1
-  ] = previous;
-
-  for (
-    let i = length;
-    i <
-      tr.length;
-    i++
-  ) {
-
-    previous =
-      (
-        (
-          previous *
-          (
-            length - 1
-          )
-        ) +
-        tr[i]
-      ) /
-      length;
-
-    result[i] =
-      previous;
-
-  }
-
-  return result;
-
-}
-
-
-// ======================================================
-// ONESIGNAL PUSH
-// ======================================================
-
-async function sendPush(
+/* =====================================================
+   ONESIGNAL
+===================================================== */
+
+async function sendOneSignal(
   title,
   message,
   data = {}
 ) {
 
-  if (
-    !ONESIGNAL_APP_ID ||
-    !ONESIGNAL_API_KEY
-  ) {
-
-    console.log(
-      "ONESIGNAL KEYS MISSING"
-    );
-
-    return;
-
-  }
-
-  try {
-
-    const response =
-      await fetch(
-        "https://api.onesignal.com/notifications",
-        {
-
-          method: "POST",
-
-          headers: {
-
-            "Content-Type":
-              "application/json; charset=utf-8",
-
-            "Authorization":
-              `Key ${ONESIGNAL_API_KEY}`
-
-          },
-
-          body:
-            JSON.stringify({
-
-              app_id:
-                ONESIGNAL_APP_ID,
-
-              target_channel:
-                "push",
-
-              included_segments: [
-                "Subscribed Users"
-              ],
-
-              headings: {
-
-                en: title
-
-              },
-
-              contents: {
-
-                en: message
-
-              },
-
-              data
-
-            })
-
-        }
-      );
-
-    const body =
-      await response.text();
-
-    console.log(
-      "ONESIGNAL:",
-      response.status,
-      body
-    );
-
-  } catch (error) {
-
-    console.log(
-      "PUSH ERROR:",
-      error.message
-    );
-
-  }
-
-}
-
-
-// ======================================================
-// TWELVE DATA
-// ======================================================
-
-async function getCandles() {
-
-  if (
-    !TWELVE_DATA_API_KEY
-  ) {
+  if (!ONESIGNAL_APP_ID) {
 
     throw new Error(
-      "TWELVE_DATA_API_KEY missing"
+      "ONESIGNAL_APP_ID missing"
     );
 
   }
 
-  const url =
-    new URL(
-      "https://api.twelvedata.com/time_series"
+  if (!ONESIGNAL_API_KEY) {
+
+    throw new Error(
+      "ONESIGNAL_API_KEY missing"
     );
 
-  url.searchParams.set(
-    "symbol",
-    SYMBOL
-  );
+  }
 
-  url.searchParams.set(
-    "interval",
-    INTERVAL
-  );
 
-  url.searchParams.set(
-    "outputsize",
-    "200"
-  );
+  const body = {
 
-  url.searchParams.set(
-    "order",
-    "asc"
-  );
+    app_id:
+      ONESIGNAL_APP_ID,
 
-  url.searchParams.set(
-    "timezone",
-    "UTC"
-  );
+    target_channel:
+      "push",
 
-  url.searchParams.set(
-    "apikey",
-    TWELVE_DATA_API_KEY
-  );
+    included_segments: [
+      "Subscribed Users"
+    ],
+
+    headings: {
+      en: title
+    },
+
+    contents: {
+      en: message
+    },
+
+    data: data,
+
+    name:
+      `BIT ADAMS ${Date.now()}`
+
+  };
+
 
   const response =
-    await fetch(url);
+    await fetch(
+      "https://api.onesignal.com/notifications",
+      {
+        method: "POST",
 
-  const data =
-    await response.json();
+        headers: {
+          "Content-Type":
+            "application/json",
 
-  if (
-    data.status ===
-    "error"
-  ) {
+          "Authorization":
+            `Key ${ONESIGNAL_API_KEY}`
+        },
 
-    throw new Error(
-      data.message ||
-      "Twelve Data error"
-    );
-
-  }
-
-  if (
-    !Array.isArray(
-      data.values
-    )
-  ) {
-
-    throw new Error(
-      "No candle data"
-    );
-
-  }
-
-  return data.values;
-
-}
-
-
-// ======================================================
-// CLOSE TRADE
-// ======================================================
-
-async function closeTrade(
-  result,
-  message
-) {
-
-  const trade =
-    state.trade;
-
-  if (!trade) return;
-
-  trade.status =
-    result;
-
-  trade.closedAt =
-    new Date().toISOString();
-
-  state.history.unshift(
-    trade
-  );
-
-  state.history =
-    state.history.slice(
-      0,
-      100
-    );
-
-  state.trade = null;
-
-  saveState();
-
-  await sendPush(
-    `ADAMS GOLD • ${result}`,
-    message,
-    {
-      symbol:
-        "XAUUSD",
-
-      timeframe:
-        "M15",
-
-      result
-    }
-  );
-
-}
-
-
-// ======================================================
-// MANAGE OPEN TRADE
-// ======================================================
-
-async function manageTrade(
-  liveCandle
-) {
-
-  const trade =
-    state.trade;
-
-  if (!trade) return;
-
-  const high =
-    n(
-      liveCandle.high
-    );
-
-  const low =
-    n(
-      liveCandle.low
-    );
-
-
-  // ====================================================
-  // BUY
-  // ====================================================
-
-  if (
-    trade.direction ===
-    "BUY"
-  ) {
-
-    // STOP LOSS / BREAK EVEN
-
-    if (
-      low <=
-      trade.stop
-    ) {
-
-      if (
-        trade.tp1Hit
-      ) {
-
-        await closeTrade(
-          "BREAK EVEN",
-          `BUY XAUUSD M15 • Break Even hit at ${price(trade.entry)}`
-        );
-
-      } else {
-
-        await closeTrade(
-          "STOP LOSS",
-          `BUY XAUUSD M15 • Stop Loss hit at ${price(trade.stop)}`
-        );
-
+        body:
+          JSON.stringify(body)
       }
-
-      return;
-
-    }
-
-
-    // TP1
-
-    if (
-      !trade.tp1Hit &&
-      high >=
-      trade.tp1
-    ) {
-
-      trade.tp1Hit =
-        true;
-
-      trade.stop =
-        trade.entry;
-
-      trade.status =
-        "TP1 HIT";
-
-      saveState();
-
-      await sendPush(
-        "ADAMS GOLD • TP1 ✅",
-        `BUY XAUUSD M15 • TP1 ${price(trade.tp1)} HIT`
-      );
-
-      await sendPush(
-        "ADAMS GOLD • BREAK EVEN 🛡️",
-        `Stop Loss moved to ENTRY ${price(trade.entry)}`
-      );
-
-    }
-
-
-    // TP2
-
-    if (
-      state.trade &&
-      !trade.tp2Hit &&
-      high >=
-      trade.tp2
-    ) {
-
-      trade.tp2Hit =
-        true;
-
-      trade.status =
-        "TP2 HIT";
-
-      saveState();
-
-      await sendPush(
-        "ADAMS GOLD • TP2 ✅",
-        `BUY XAUUSD M15 • TP2 ${price(trade.tp2)} HIT`
-      );
-
-    }
-
-
-    // TP3
-
-    if (
-      state.trade &&
-      high >=
-      trade.tp3
-    ) {
-
-      await closeTrade(
-        "TP3 WIN",
-        `BUY XAUUSD M15 • TP3 ${price(trade.tp3)} HIT • WIN ✅`
-      );
-
-      return;
-
-    }
-
-  }
-
-
-  // ====================================================
-  // SELL
-  // ====================================================
-
-  if (
-    trade.direction ===
-    "SELL"
-  ) {
-
-    // STOP LOSS / BREAK EVEN
-
-    if (
-      high >=
-      trade.stop
-    ) {
-
-      if (
-        trade.tp1Hit
-      ) {
-
-        await closeTrade(
-          "BREAK EVEN",
-          `SELL XAUUSD M15 • Break Even hit at ${price(trade.entry)}`
-        );
-
-      } else {
-
-        await closeTrade(
-          "STOP LOSS",
-          `SELL XAUUSD M15 • Stop Loss hit at ${price(trade.stop)}`
-        );
-
-      }
-
-      return;
-
-    }
-
-
-    // TP1
-
-    if (
-      !trade.tp1Hit &&
-      low <=
-      trade.tp1
-    ) {
-
-      trade.tp1Hit =
-        true;
-
-      trade.stop =
-        trade.entry;
-
-      trade.status =
-        "TP1 HIT";
-
-      saveState();
-
-      await sendPush(
-        "ADAMS GOLD • TP1 ✅",
-        `SELL XAUUSD M15 • TP1 ${price(trade.tp1)} HIT`
-      );
-
-      await sendPush(
-        "ADAMS GOLD • BREAK EVEN 🛡️",
-        `Stop Loss moved to ENTRY ${price(trade.entry)}`
-      );
-
-    }
-
-
-    // TP2
-
-    if (
-      state.trade &&
-      !trade.tp2Hit &&
-      low <=
-      trade.tp2
-    ) {
-
-      trade.tp2Hit =
-        true;
-
-      trade.status =
-        "TP2 HIT";
-
-      saveState();
-
-      await sendPush(
-        "ADAMS GOLD • TP2 ✅",
-        `SELL XAUUSD M15 • TP2 ${price(trade.tp2)} HIT`
-      );
-
-    }
-
-
-    // TP3
-
-    if (
-      state.trade &&
-      low <=
-      trade.tp3
-    ) {
-
-      await closeTrade(
-        "TP3 WIN",
-        `SELL XAUUSD M15 • TP3 ${price(trade.tp3)} HIT • WIN ✅`
-      );
-
-      return;
-
-    }
-
-  }
-
-}
-
-
-// ======================================================
-// OPEN BUY
-// ======================================================
-
-async function openBuy(
-  candle,
-  atrValue
-) {
-
-  const entry =
-    n(
-      candle.close
     );
 
-  const trade = {
 
-    direction:
-      "BUY",
-
-    symbol:
-      "XAUUSD",
-
-    timeframe:
-      "M15",
-
-    entry,
-
-    stop:
-      entry -
-      (
-        atrValue *
-        SL_ATR
-      ),
-
-    originalStop:
-      entry -
-      (
-        atrValue *
-        SL_ATR
-      ),
-
-    tp1:
-      entry +
-      (
-        atrValue *
-        TP1_ATR
-      ),
-
-    tp2:
-      entry +
-      (
-        atrValue *
-        TP2_ATR
-      ),
-
-    tp3:
-      entry +
-      (
-        atrValue *
-        TP3_ATR
-      ),
-
-    tp1Hit:
-      false,
-
-    tp2Hit:
-      false,
-
-    status:
-      "OPEN",
-
-    signalCandle:
-      candle.datetime,
-
-    openedAt:
-      new Date()
-        .toISOString()
-
-  };
-
-  state.trade =
-    trade;
-
-  saveState();
-
-  await sendPush(
-    "🟢 ADAMS GOLD • BUY",
-    `XAUUSD M15
-ENTRY ${price(trade.entry)}
-STOP LOSS ${price(trade.stop)}
-TP1 ${price(trade.tp1)}
-TP2 ${price(trade.tp2)}
-TP3 ${price(trade.tp3)}`,
-    {
-      direction:
-        "BUY"
-    }
-  );
-
-}
+  const text =
+    await response.text();
 
 
-// ======================================================
-// OPEN SELL
-// ======================================================
-
-async function openSell(
-  candle,
-  atrValue
-) {
-
-  const entry =
-    n(
-      candle.close
-    );
-
-  const trade = {
-
-    direction:
-      "SELL",
-
-    symbol:
-      "XAUUSD",
-
-    timeframe:
-      "M15",
-
-    entry,
-
-    stop:
-      entry +
-      (
-        atrValue *
-        SL_ATR
-      ),
-
-    originalStop:
-      entry +
-      (
-        atrValue *
-        SL_ATR
-      ),
-
-    tp1:
-      entry -
-      (
-        atrValue *
-        TP1_ATR
-      ),
-
-    tp2:
-      entry -
-      (
-        atrValue *
-        TP2_ATR
-      ),
-
-    tp3:
-      entry -
-      (
-        atrValue *
-        TP3_ATR
-      ),
-
-    tp1Hit:
-      false,
-
-    tp2Hit:
-      false,
-
-    status:
-      "OPEN",
-
-    signalCandle:
-      candle.datetime,
-
-    openedAt:
-      new Date()
-        .toISOString()
-
-  };
-
-  state.trade =
-    trade;
-
-  saveState();
-
-  await sendPush(
-    "🔴 ADAMS GOLD • SELL",
-    `XAUUSD M15
-ENTRY ${price(trade.entry)}
-STOP LOSS ${price(trade.stop)}
-TP1 ${price(trade.tp1)}
-TP2 ${price(trade.tp2)}
-TP3 ${price(trade.tp3)}`,
-    {
-      direction:
-        "SELL"
-    }
-  );
-
-}
-
-
-// ======================================================
-// SCANNER
-// ======================================================
-
-let scanning =
-  false;
-
-
-async function scanMarket() {
-
-  if (scanning) {
-
-    return;
-
-  }
-
-  scanning =
-    true;
+  let result;
 
   try {
-
-    const allCandles =
-      await getCandles();
-
-    if (
-      allCandles.length <
-      60
-    ) {
-
-      throw new Error(
-        "Not enough candles"
-      );
-
-    }
-
-
-    // --------------------------------------------------
-    // LIVE CANDLE
-    // --------------------------------------------------
-
-    const liveCandle =
-      allCandles[
-        allCandles.length - 1
-      ];
-
-
-    // --------------------------------------------------
-    // FIND CLOSED M15 CANDLES
-    // --------------------------------------------------
-
-    const now =
-      Date.now();
-
-    const closedCandles =
-      allCandles.filter(
-        candle => {
-
-          const openTime =
-            parseTime(
-              candle.datetime
-            );
-
-          const closeTime =
-            openTime +
-            (
-              15 *
-              60 *
-              1000
-            );
-
-          return (
-            closeTime <= now
-          );
-
-        }
-      );
-
-
-    if (
-      closedCandles.length <
-      60
-    ) {
-
-      throw new Error(
-        "Not enough closed candles"
-      );
-
-    }
-
-
-    // --------------------------------------------------
-    // MANAGE CURRENT TRADE
-    // --------------------------------------------------
-
-    if (
-      state.trade
-    ) {
-
-      await manageTrade(
-        liveCandle
-      );
-
-    }
-
-
-    // Only one trade at a time
-
-    if (
-      state.trade
-    ) {
-
-      return;
-
-    }
-
-
-    // --------------------------------------------------
-    // CALCULATIONS
-    // --------------------------------------------------
-
-    const closes =
-      closedCandles.map(
-        candle =>
-          n(
-            candle.close
-          )
-      );
-
-    const ema9 =
-      emaSeries(
-        closes,
-        EMA_FAST
-      );
-
-    const ema21 =
-      emaSeries(
-        closes,
-        EMA_SLOW
-      );
-
-    const ema50 =
-      emaSeries(
-        closes,
-        EMA_TREND
-      );
-
-    const rsi =
-      rsiSeries(
-        closes,
-        RSI_LENGTH
-      );
-
-    const atr =
-      atrSeries(
-        closedCandles,
-        ATR_LENGTH
-      );
-
-
-    const i =
-      closedCandles.length -
-      1;
-
-    const previous =
-      i - 1;
-
-    const candle =
-      closedCandles[i];
-
-
-    // --------------------------------------------------
-    // DO NOT PROCESS SAME CLOSED CANDLE TWICE
-    // --------------------------------------------------
-
-    if (
-      state.lastSignalCandle ===
-      candle.datetime
-    ) {
-
-      return;
-
-    }
-
-
-    state.lastSignalCandle =
-      candle.datetime;
-
-    saveState();
-
-
-    // --------------------------------------------------
-    // BUY LOGIC
-    // --------------------------------------------------
-
-    const buyCross =
-
-      ema9[previous] <=
-        ema21[previous] &&
-
-      ema9[i] >
-        ema21[i];
-
-
-    const buySignal =
-
-      buyCross &&
-
-      closes[i] >
-        ema50[i] &&
-
-      rsi[i] >
-        50;
-
-
-    // --------------------------------------------------
-    // SELL LOGIC
-    // --------------------------------------------------
-
-    const sellCross =
-
-      ema9[previous] >=
-        ema21[previous] &&
-
-      ema9[i] <
-        ema21[i];
-
-
-    const sellSignal =
-
-      sellCross &&
-
-      closes[i] <
-        ema50[i] &&
-
-      rsi[i] <
-        50;
-
-
-    console.log(
-      "M15:",
-      candle.datetime,
-      "Close:",
-      closes[i],
-      "RSI:",
-      rsi[i]?.toFixed(2),
-      "BUY:",
-      buySignal,
-      "SELL:",
-      sellSignal
+    result = JSON.parse(text);
+  } catch {
+    result = {
+      raw: text
+    };
+  }
+
+
+  if (!response.ok) {
+
+    console.error(
+      "ONESIGNAL ERROR:",
+      response.status,
+      result
     );
 
-
-    // --------------------------------------------------
-    // OPEN SIGNAL
-    // --------------------------------------------------
-
-    if (
-      buySignal
-    ) {
-
-      await openBuy(
-        candle,
-        atr[i]
-      );
-
-    }
-
-
-    if (
-      sellSignal
-    ) {
-
-      await openSell(
-        candle,
-        atr[i]
-      );
-
-    }
-
-  } catch (error) {
-
-    console.log(
-      "SCAN ERROR:",
-      error.message
+    throw new Error(
+      `OneSignal error ${response.status}`
     );
-
-  } finally {
-
-    scanning =
-      false;
 
   }
 
+
+  console.log(
+    "ONESIGNAL SENT:",
+    result
+  );
+
+
+  return result;
 }
 
 
-// ======================================================
-// API
-// ======================================================
+/* =====================================================
+   HEALTH
+===================================================== */
+
+app.get(
+  "/health",
+  (req, res) => {
+
+    res.status(200).json({
+
+      ok: true,
+
+      service:
+        "BIT ADAMS SERVER",
+
+      status:
+        "UP",
+
+      time:
+        new Date().toISOString()
+
+    });
+
+  }
+);
+
+
+/* =====================================================
+   HOME
+===================================================== */
 
 app.get(
   "/",
-  (
-    req,
-    res
-  ) => {
+  (req, res) => {
 
     res.json({
 
       app:
-        "ADAMS GOLD",
+        "BIT ADAMS",
 
       status:
         "ONLINE",
 
-      symbol:
-        "XAUUSD",
+      endpoints: {
 
-      timeframe:
-        "M15",
+        health:
+          "/health",
 
-      scanner:
-        `${SCAN_SECONDS}s`,
+        tradingview:
+          "/tradingview-webhook"
 
-      trade:
-        state.trade
+      }
 
     });
 
@@ -1534,82 +534,222 @@ app.get(
 );
 
 
-app.get(
-  "/health",
-  (
-    req,
-    res
-  ) => {
+/* =====================================================
+   TRADINGVIEW WEBHOOK
+===================================================== */
 
-    res.json({
+async function tradingViewWebhook(
+  req,
+  res
+) {
 
-      ok: true,
+  try {
 
-      time:
-        new Date()
-          .toISOString()
-
-    });
-
-  }
-);
+    const payload =
+      normalizePayload(
+        req.body
+      );
 
 
-app.get(
-  "/state",
-  (
-    req,
-    res
-  ) => {
-
-    res.json(
-      state
+    console.log(
+      "TRADINGVIEW RECEIVED:",
+      payload
     );
 
-  }
-);
+
+    /* OPTIONAL SECURITY */
+
+    if (WEBHOOK_SECRET) {
+
+      const receivedSecret =
+        clean(
+          payload.secret
+        );
+
+      if (
+        receivedSecret !==
+        WEBHOOK_SECRET
+      ) {
+
+        return res
+          .status(401)
+          .json({
+            ok: false,
+            error:
+              "Invalid webhook secret"
+          });
+
+      }
+
+    }
 
 
-// ======================================================
-// TEST NOTIFICATION
-// Open:
-// https://YOUR-RENDER-URL/test-push?key=YOUR_TEST_KEY
-// ======================================================
+    const event =
+      detectEvent(
+        payload
+      );
 
-app.get(
-  "/test-push",
-  async (
-    req,
-    res
-  ) => {
 
-    if (
-      !TEST_KEY ||
-      req.query.key !==
-        TEST_KEY
-    ) {
+    if (!event) {
 
       return res
-        .status(401)
+        .status(400)
         .json({
+
+          ok: false,
+
           error:
-            "Unauthorized"
+            "Unknown event",
+
+          received:
+            payload
+
         });
 
     }
 
-    await sendPush(
-      "✅ ADAMS GOLD",
-      "Notifications are working."
+
+    const symbol =
+      normalizeSymbol(
+        payload.symbol ||
+        payload.ticker ||
+        payload.asset ||
+        ""
+      );
+
+
+    const title =
+      getTitle(
+        event,
+        symbol
+      );
+
+
+    const message =
+      buildMessage(
+        event,
+        symbol,
+        payload
+      );
+
+
+    const oneSignalResult =
+      await sendOneSignal(
+        title,
+        message,
+        {
+
+          source:
+            "TradingView",
+
+          event:
+            event,
+
+          symbol:
+            symbol,
+
+          timeframe:
+            clean(
+              payload.timeframe ||
+              payload.tf ||
+              payload.interval
+            ),
+
+          entry:
+            clean(payload.entry),
+
+          sl:
+            clean(payload.sl),
+
+          tp1:
+            clean(payload.tp1),
+
+          tp2:
+            clean(payload.tp2),
+
+          tp3:
+            clean(payload.tp3),
+
+          price:
+            clean(
+              payload.price ||
+              payload.close
+            )
+
+        }
+      );
+
+
+    return res
+      .status(200)
+      .json({
+
+        ok: true,
+
+        event:
+          event,
+
+        symbol:
+          symbol,
+
+        notification:
+          oneSignalResult
+
+      });
+
+
+  } catch (error) {
+
+    console.error(
+      "WEBHOOK ERROR:",
+      error
     );
 
-    res.json({
 
-      success:
-        true,
+    return res
+      .status(500)
+      .json({
 
-      message:
-        "Test notification sent"
+        ok: false,
+
+        error:
+          error.message
+
+      });
+
+  }
+
+}
+
+
+/* =====================================================
+   WEBHOOK ROUTES
+===================================================== */
+
+app.post(
+  "/tradingview-webhook",
+  tradingViewWebhook
+);
+
+app.post(
+  "/webhook",
+  tradingViewWebhook
+);
+
+
+/* =====================================================
+   404
+===================================================== */
+
+app.use(
+  (req, res) => {
+
+    res.status(404).json({
+
+      ok: false,
+
+      error:
+        "Route not found"
 
     });
 
@@ -1617,26 +757,22 @@ app.get(
 );
 
 
-// ======================================================
-// START
-// ======================================================
+/* =====================================================
+   START SERVER
+===================================================== */
 
 app.listen(
   PORT,
+  "0.0.0.0",
   () => {
 
     console.log(
-      `ADAMS GOLD running on port ${PORT}`
+      `BIT ADAMS server running on port ${PORT}`
+    );
+
+    console.log(
+      "TradingView webhook ready"
     );
 
   }
-);
-
-
-scanMarket();
-
-setInterval(
-  scanMarket,
-  SCAN_SECONDS *
-    1000
 );
