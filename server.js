@@ -68,6 +68,8 @@ function eventMessage(event, symbol, payload = {}) {
   const labels = { BUY:"🟢 SIGNAL: BUY", SELL:"🔴 SIGNAL: SELL", TP1:"✅ TAKE PROFIT 1 HIT\nMOVE SL TO ENTRY", TP2:"✅ TAKE PROFIT 2 HIT", TP3:"🏆 TAKE PROFIT 3 HIT\nTRADE WIN", WIN:"🏆 TRADE WIN", SL:"⛔ STOP LOSS HIT", BREAK_EVEN:"🟡 BREAK-EVEN\nTRADE CLOSED AT ENTRY" };
   if (labels[event]) lines.push(labels[event]);
   for (const [label, value] of [["ENTRY",payload.entry ?? payload.entryPrice],["SL",payload.sl ?? payload.stopLoss],["TP1",payload.tp1],["TP2",payload.tp2],["TP3",payload.tp3],["PRICE",payload.price ?? payload.close]]) if (clean(value)) lines.push(`${label}: ${clean(value)}`);
+  const originalMessage = clean(payload.message);
+  if (originalMessage && !lines.some(line => line.includes(originalMessage))) lines.push(originalMessage);
   return lines.join("\n");
 }
 
