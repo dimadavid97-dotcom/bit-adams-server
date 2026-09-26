@@ -9,6 +9,8 @@ const PORT = Number(process.env.PORT || 10000);
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY || process.env.TWELVEDATA_API_KEY || "";
 const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || "";
 const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY || "";
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const SCAN_CACHE_MS = 60_000;
 const SIGNAL_COOLDOWN_MS = 15 * 60_000;
@@ -84,6 +86,25 @@ async function sendOneSignal(title, message, data = {}) {
   return result;
 }
 
+async function sendTelegram(title, message) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.warn("Telegram skipped: environment keys missing");
+    return { skipped: true };
+  }
+  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type":"application/json" },
+    body: JSON.stringify({
+      chat_id: TELEGRAM_CHAT_ID,
+      text: `${title}\n\n${message}`,
+      disable_web_page_preview: true
+    })
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.ok === false) throw new Error(`Telegram error ${response.status}: ${JSON.stringify(result)}`);
+  return result;
+}
+
 function ema(values, period) {
   if (!values.length) return [];
   const k = 2 / (period + 1); const out = [values[0]];
@@ -143,8 +164,18 @@ function levels(symbol, direction, price, a) {
 }
 
 async function notifyEvent(event, symbol, payload) {
-  try { return await sendOneSignal(eventTitle(event,symbol), eventMessage(event,symbol,payload), { source:"BIT ADAMS", event, symbol, ...payload }); }
-  catch (error) { console.error("Notification error:", error.message); return { error:error.message }; }
+  const title = eventTitle(event,symbol);
+  const message = eventMessage(event,symbol,payload);
+  const [oneSignal, telegram] = await Promise.allSettled([
+    sendOneSignal(title, message, { source:"BIT ADAMS", event, symbol, ...payload }),
+    sendTelegram(title, message)
+  ]);
+  if (oneSignal.status === "rejected") console.error("OneSignal error:", oneSignal.reason?.message);
+  if (telegram.status === "rejected") console.error("Telegram error:", telegram.reason?.message);
+  return {
+    oneSignal: oneSignal.status === "fulfilled" ? oneSignal.value : { error:oneSignal.reason?.message },
+    telegram: telegram.status === "fulfilled" ? telegram.value : { error:telegram.reason?.message }
+  };
 }
 
 async function updateTrade(symbol, analysis) {
@@ -200,9 +231,16 @@ async function getScan(force = false) {
   return scanPromise;
 }
 
-app.get("/health", (req,res) => res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.7 LIVE", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), time:new Date().toISOString() }));
-app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.7 LIVE", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", tradingview:"/tradingview-webhook" } }));
+app.get("/health", (req,res) => res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.8 TELEGRAM", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() }));
+app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.8 TELEGRAM", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
 app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan(req.query.refresh === "1")); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
+app.get("/api/test-telegram", async (req,res) => {
+  try {
+    const telegram = await sendTelegram("✅ BIT ADAMS TEST", "Notificările Telegram funcționează.");
+    if (telegram.skipped) return res.status(503).json({ok:false,error:"Telegram environment keys missing"});
+    res.json({ok:true,telegram});
+  } catch(error) { res.status(500).json({ok:false,error:error.message}); }
+});
 
 async function tradingViewWebhook(req,res) {
   try {
@@ -210,11 +248,11 @@ async function tradingViewWebhook(req,res) {
     if (WEBHOOK_SECRET && clean(payload.secret)!==WEBHOOK_SECRET) return res.status(401).json({ok:false,error:"Invalid webhook secret"});
     const event=detectEvent(payload); if(!event) return res.status(400).json({ok:false,error:"Unknown event",received:payload});
     const symbol=normalizeSymbol(payload.symbol || payload.ticker || payload.asset);
-    const notification=await sendOneSignal(eventTitle(event,symbol),eventMessage(event,symbol,payload),{source:"TradingView",event,symbol,timeframe:clean(payload.timeframe||payload.tf||payload.interval)});
+    const notification=await notifyEvent(event,symbol,{...payload,source:"TradingView",timeframe:clean(payload.timeframe||payload.tf||payload.interval)});
     res.json({ok:true,event,symbol,notification});
   } catch(error) { console.error("Webhook error:",error); res.status(500).json({ok:false,error:error.message}); }
 }
 
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
-app.listen(PORT,"0.0.0.0",() => console.log(`BIT ADAMS 8.7 running on port ${PORT}`));
+app.listen(PORT,"0.0.0.0",() => console.log(`BIT ADAMS 8.8 TELEGRAM running on port ${PORT}`));
