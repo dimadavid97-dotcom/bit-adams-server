@@ -147,7 +147,8 @@ function analyse(candles) {
   if (momentum > 0) bull += 25; else if (momentum < 0) bear += 25;
   const confidence = Math.round(Math.max(bull, bear));
   const signal = confidence >= 55 ? (bull > bear ? "BUY" : "SELL") : "WAIT";
-  return { signal, confidence, price:last, ema9:lastE9, ema21:lastE21, rsi:round(r,1), atr:a, momentum:round(momentum,3) };
+  const latest = candles.at(-1) || {};
+  return { signal, confidence, price:last, high:latest.high, low:latest.low, ema9:lastE9, ema21:lastE21, rsi:round(r,1), atr:a, momentum:round(momentum,3) };
 }
 
 async function candles(symbol, interval) {
@@ -184,6 +185,8 @@ async function notifyEvent(event, symbol, payload) {
 async function updateTrade(symbol, analysis) {
   let trade = liveTrades.get(symbol);
   const price = analysis.price;
+  const high = Number.isFinite(analysis.m5?.high) ? analysis.m5.high : price;
+  const low = Number.isFinite(analysis.m5?.low) ? analysis.m5.low : price;
   if (!trade && ["BUY","SELL"].includes(analysis.signal) && analysis.confirmed) {
     const cooldown = Date.now() - (lastSignalAt.get(symbol) || 0);
     if (cooldown >= SIGNAL_COOLDOWN_MS) {
@@ -193,7 +196,7 @@ async function updateTrade(symbol, analysis) {
     }
   }
   if (!trade) return null;
-  const buy = trade.direction === "BUY"; const hit = target => buy ? price >= target : price <= target; const stopped = buy ? price <= trade.sl : price >= trade.sl;
+  const buy = trade.direction === "BUY"; const hit = target => buy ? high >= target : low <= target; const stopped = buy ? low <= trade.sl : high >= trade.sl;
   let event = "";
   if (trade.status === "OPEN" && hit(trade.tp1)) { trade.status="TP1"; trade.sl=trade.entry; event="TP1"; }
   else if (trade.status === "TP1" && hit(trade.tp2)) { trade.status="TP2"; event="TP2"; }
@@ -243,6 +246,26 @@ app.get("/api/test-telegram", async (req,res) => {
     if (telegram.skipped) return res.status(503).json({ok:false,error:"Telegram environment keys missing"});
     res.json({ok:true,telegram});
   } catch(error) { res.status(500).json({ok:false,error:error.message}); }
+});
+
+app.post("/api/notify", async (req,res) => {
+  try {
+    const payload = normalizePayload(req.body);
+    const event = detectEvent(payload);
+    if (!event) return res.status(400).json({ok:false,error:"Unknown notification event"});
+    const trade = payload.trade && typeof payload.trade === "object" ? payload.trade : {};
+    const symbol = normalizeSymbol(trade.asset || trade.symbol || payload.symbol || payload.asset);
+    const notification = await notifyEvent(event, symbol, {
+      ...trade,
+      ...payload,
+      source:"BIT ADAMS APP",
+      timeframe:clean(trade.timeframe || payload.timeframe)
+    });
+    res.json({ok:true,event,symbol,notification});
+  } catch(error) {
+    console.error("App notification error:",error);
+    res.status(500).json({ok:false,error:error.message});
+  }
 });
 
 async function tradingViewWebhook(req,res) {
