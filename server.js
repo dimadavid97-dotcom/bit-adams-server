@@ -14,6 +14,7 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const SCAN_CACHE_MS = 60_000;
 const SIGNAL_COOLDOWN_MS = 15 * 60_000;
+const BACKGROUND_SCAN_MS = 65_000;
 
 app.use(cors());
 app.use(express.json({ limit: "100kb" }));
@@ -233,8 +234,8 @@ async function getScan(force = false) {
   return scanPromise;
 }
 
-app.get("/health", (req,res) => res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.8 TELEGRAM", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() }));
-app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.8 TELEGRAM", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
+app.get("/health", (req,res) => res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.9 AUTO-SCAN", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() }));
+app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.9 AUTO-SCAN", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
 app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan(req.query.refresh === "1")); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
 app.get("/api/test-telegram", async (req,res) => {
   try {
@@ -257,4 +258,10 @@ async function tradingViewWebhook(req,res) {
 
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
-app.listen(PORT,"0.0.0.0",() => console.log(`BIT ADAMS 8.8 TELEGRAM running on port ${PORT}`));
+app.listen(PORT,"0.0.0.0",() => {
+  console.log(`BIT ADAMS 8.9 AUTO-SCAN running on port ${PORT}`);
+  getScan(true).catch(error => console.error("Initial scan error:", error.message));
+  setInterval(() => {
+    getScan(true).catch(error => console.error("Background scan error:", error.message));
+  }, BACKGROUND_SCAN_MS);
+});
