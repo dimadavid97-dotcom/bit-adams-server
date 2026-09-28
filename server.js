@@ -12,9 +12,9 @@ const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY || "";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
-const SCAN_CACHE_MS = 60_000;
+const SCAN_CACHE_MS = 5 * 60_000;
 const SIGNAL_COOLDOWN_MS = 15 * 60_000;
-const BACKGROUND_SCAN_MS = 65_000;
+const BACKGROUND_SCAN_MS = 5 * 60_000;
 
 app.use(cors());
 app.use(express.json({ limit: "100kb" }));
@@ -23,6 +23,9 @@ app.use(express.text({ type: ["text/plain", "application/text"], limit: "100kb" 
 let scanCache = null;
 let scanCacheAt = 0;
 let scanPromise = null;
+let dailyLimitResetAt = 0;
+let lastProviderError = "";
+let lastSuccessfulScanAt = 0;
 const liveTrades = new Map();
 const lastSignalAt = new Map();
 
@@ -151,15 +154,55 @@ function analyse(candles) {
   return { signal, confidence, price:last, high:latest.high, low:latest.low, ema9:lastE9, ema21:lastE21, rsi:round(r,1), atr:a, momentum:round(momentum,3) };
 }
 
-async function candles(symbol, interval) {
+function nextUtcMidnight() {
+  const now = new Date();
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+}
+
+async function candles(symbol) {
   if (!TWELVE_DATA_API_KEY) throw new Error("TWELVE_DATA_API_KEY missing in Render");
   const pair = symbol === "XAUUSD" ? "XAU/USD" : "BTC/USD";
   const url = new URL("https://api.twelvedata.com/time_series");
-  url.search = new URLSearchParams({ symbol:pair, interval, outputsize:"80", order:"ASC", apikey:TWELVE_DATA_API_KEY });
+  url.search = new URLSearchParams({ symbol:pair, interval:"5min", outputsize:"80", order:"ASC", timezone:"UTC", apikey:TWELVE_DATA_API_KEY });
   const response = await fetch(url);
   const data = await response.json();
-  if (!response.ok || data.status === "error" || !Array.isArray(data.values)) throw new Error(data.message || `Twelve Data ${response.status}`);
+  if (!response.ok || data.status === "error" || !Array.isArray(data.values)) {
+    const message = data.message || `Twelve Data ${response.status}`;
+    lastProviderError = message;
+    if (/credits for the day|daily limit|quota.*day/i.test(message)) {
+      const now = new Date();
+      dailyLimitResetAt = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+    }
+    throw new Error(message);
+  }
   return data.values.map(v => ({ datetime:v.datetime, open:Number(v.open), high:Number(v.high), low:Number(v.low), close:Number(v.close) })).filter(v => Number.isFinite(v.close));
+}
+
+function aggregateTo15m(candles5m) {
+  const groups = new Map();
+  const now = Date.now();
+  for (const candle of candles5m) {
+    const datetime = String(candle.datetime || "").replace(" ", "T");
+    const normalized = /(?:Z|[+-]\\d{2}:?\\d{2})$/i.test(datetime) ? datetime : `${datetime}Z`;
+    const timestamp = Date.parse(normalized);
+    if (!Number.isFinite(timestamp)) continue;
+    const bucket = Math.floor(timestamp / 900_000) * 900_000;
+    if (bucket + 900_000 > now) continue;
+    const group = groups.get(bucket);
+    if (!group) {
+      groups.set(bucket, { timestamp:bucket, datetime:candle.datetime, open:candle.open, high:candle.high, low:candle.low, close:candle.close, times:new Set([timestamp]) });
+      continue;
+    }
+    if (group.times.has(timestamp)) continue;
+    group.times.add(timestamp);
+    group.high = Math.max(group.high, candle.high);
+    group.low = Math.min(group.low, candle.low);
+    group.close = candle.close;
+  }
+  return [...groups.values()]
+    .filter(group => group.times.size === 3)
+    .sort((a,b) => a.timestamp - b.timestamp)
+    .map(({datetime,open,high,low,close}) => ({datetime,open,high,low,close}));
 }
 
 function levels(symbol, direction, price, a) {
@@ -208,7 +251,9 @@ async function updateTrade(symbol, analysis) {
 }
 
 async function analyseAsset(symbol) {
-  const [m5Candles,m15Candles] = await Promise.all([candles(symbol,"5min"),candles(symbol,"15min")]);
+  const m5Candles = await candles(symbol);
+  const m15Candles = aggregateTo15m(m5Candles);
+  if (m15Candles.length < 22) throw new Error("Not enough completed candles to confirm M15 conditions");
   const m5 = analyse(m5Candles), m15 = analyse(m15Candles);
   const same = m5.signal !== "WAIT" && m5.signal === m15.signal;
   const notOpposite = m5.signal !== "WAIT" && (m15.signal === "WAIT" || m5.signal === m15.signal);
@@ -231,15 +276,35 @@ async function performScan() {
 }
 
 async function getScan(force = false) {
+  if (dailyLimitResetAt > Date.now()) {
+    if (scanCache) return scanCache;
+    const error = `Twelve Data daily credits exhausted. Retry after ${new Date(dailyLimitResetAt).toISOString()}.`;
+    return { ok:true, version:"8.7 LIVE", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
+      XAUUSD:{symbol:"XAUUSD",name:"GOLD",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}},
+      BTCUSD:{symbol:"BTCUSD",name:"BITCOIN",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}}
+    }};
+  }
   if (!force && scanCache && Date.now()-scanCacheAt < SCAN_CACHE_MS) return scanCache;
   if (scanPromise) return scanPromise;
-  scanPromise = performScan().then(data => { scanCache=data; scanCacheAt=Date.now(); return data; }).finally(() => { scanPromise=null; });
+  scanPromise = performScan().then(data => {
+    scanCache=data;
+    scanCacheAt=Date.now();
+    const errors=Object.values(data.assets || {}).filter(asset => asset.status === "ERROR").map(asset => asset.error).filter(Boolean);
+    if (errors.length) lastProviderError=errors[0];
+    else { lastProviderError=""; lastSuccessfulScanAt=scanCacheAt; }
+    return data;
+  }).finally(() => { scanPromise=null; });
   return scanPromise;
 }
 
-app.get("/health", (req,res) => res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.9 AUTO-SCAN", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() }));
+app.get("/health", (req,res) => {
+  const dailyLimit = dailyLimitResetAt > Date.now();
+  const fresh = lastSuccessfulScanAt > 0 && Date.now() - lastSuccessfulScanAt < SCAN_CACHE_MS * 2;
+  const marketDataStatus = !TWELVE_DATA_API_KEY ? "NOT_CONFIGURED" : dailyLimit ? "DAILY_LIMIT" : fresh ? "CONNECTED" : scanCache ? "UNAVAILABLE" : "CHECKING";
+  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.9 AUTO-SCAN", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
+});
 app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.9 AUTO-SCAN", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
-app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan(req.query.refresh === "1")); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
+app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan()); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
 app.get("/api/test-telegram", async (req,res) => {
   try {
     const telegram = await sendTelegram("✅ BIT ADAMS TEST", "Notificările Telegram funcționează.");
