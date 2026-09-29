@@ -51,7 +51,7 @@ const symbolLabel = symbol => symbol === "XAUUSD" ? "GOLD" : symbol === "BTCUSD"
 
 function isClosedM5Candle(datetime) {
   const value = String(datetime || "").trim().replace(" ", "T");
-  const iso = /(?:Z|[+-]\\d{2}:?\\d{2})$/i.test(value) ? value : `${value}Z`;
+  const iso = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value) ? value : value + "Z";
   const start = Date.parse(iso);
   return Number.isFinite(start) && start + 5 * 60_000 <= Date.now();
 }
