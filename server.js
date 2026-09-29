@@ -12,9 +12,9 @@ const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY || "";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
-const SCAN_CACHE_MS = 5 * 60_000;
+const SCAN_CACHE_MS = 4 * 60_000;
 const SIGNAL_COOLDOWN_MS = 15 * 60_000;
-const BACKGROUND_SCAN_MS = 5 * 60_000;
+const BACKGROUND_SCAN_MS = 4 * 60_000;
 
 app.use(cors());
 app.use(express.json({ limit: "100kb" }));
@@ -84,6 +84,7 @@ async function sendOneSignal(title, message, data = {}) {
   }
   const response = await fetch("https://api.onesignal.com/notifications", {
     method: "POST",
+    signal: AbortSignal.timeout(8_000),
     headers: { "Content-Type":"application/json", Authorization:`Key ${ONESIGNAL_API_KEY}` },
     body: JSON.stringify({ app_id:ONESIGNAL_APP_ID, target_channel:"push", included_segments:["Subscribed Users"], headings:{ en:title }, contents:{ en:message }, data, name:`BIT ADAMS ${Date.now()}` })
   });
@@ -99,6 +100,7 @@ async function sendTelegram(title, message) {
   }
   const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
+    signal: AbortSignal.timeout(8_000),
     headers: { "Content-Type":"application/json" },
     body: JSON.stringify({
       chat_id: TELEGRAM_CHAT_ID,
@@ -164,7 +166,7 @@ async function candles(symbol) {
   const pair = symbol === "XAUUSD" ? "XAU/USD" : "BTC/USD";
   const url = new URL("https://api.twelvedata.com/time_series");
   url.search = new URLSearchParams({ symbol:pair, interval:"5min", outputsize:"80", order:"ASC", timezone:"UTC", apikey:TWELVE_DATA_API_KEY });
-  const response = await fetch(url);
+  const response = await fetch(url, { signal:AbortSignal.timeout(10_000) });
   const data = await response.json();
   if (!response.ok || data.status === "error" || !Array.isArray(data.values)) {
     const message = data.message || `Twelve Data ${response.status}`;
@@ -272,7 +274,7 @@ async function performScan() {
     const symbol = i === 0 ? "XAUUSD" : "BTCUSD";
     assets[symbol] = settled[i].status === "fulfilled" ? settled[i].value : { symbol, name:symbolLabel(symbol), signal:"WAIT", confidence:0, status:"ERROR", error:settled[i].reason?.message || "Data unavailable", timeframes:{} };
   }
-  return { ok:true, version:"8.7 LIVE", updatedAt:new Date().toISOString(), cacheSeconds:60, assets };
+  return { ok:true, version:"8.7 LIVE", updatedAt:new Date().toISOString(), cacheSeconds:240, assets };
 }
 
 async function getScan(force = false) {
