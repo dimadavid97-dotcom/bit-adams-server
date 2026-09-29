@@ -14,6 +14,7 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const SCAN_CACHE_MS = 25_000;
 const SIGNAL_COOLDOWN_MS = 15 * 60_000;
+const MIN_SIGNAL_SCORE = 68;
 const BACKGROUND_SCAN_MS = 25_000;
 
 app.use(cors());
@@ -48,6 +49,13 @@ function normalizeSymbol(value) {
 
 const symbolLabel = symbol => symbol === "XAUUSD" ? "GOLD" : symbol === "BTCUSD" ? "BITCOIN" : symbol;
 
+function isClosedM5Candle(datetime) {
+  const value = String(datetime || "").trim().replace(" ", "T");
+  const iso = /(?:Z|[+-]\\d{2}:?\\d{2})$/i.test(value) ? value : `${value}Z`;
+  const start = Date.parse(iso);
+  return Number.isFinite(start) && start + 5 * 60_000 <= Date.now();
+}
+
 function detectEvent(payload) {
   const raw = clean(payload.event || payload.action || payload.signal || payload.type || payload.side || payload.status || payload.message).toUpperCase();
   if (/BREAK[ -]?EVEN|\bBE\b/.test(raw)) return "BREAK_EVEN";
@@ -69,6 +77,8 @@ function eventTitle(event, symbol) {
 function eventMessage(event, symbol, payload = {}) {
   const tf = clean(payload.timeframe || payload.tf || payload.interval);
   const lines = [`${symbolLabel(symbol)}${tf ? ` • ${tf}` : ""}`];
+  const setupType = clean(payload.setupType);
+  if (setupType) lines.push(`SETUP: ${setupType}`);
   const labels = { BUY:"🟢 SIGNAL: BUY", SELL:"🔴 SIGNAL: SELL", TP1:"✅ TAKE PROFIT 1 HIT\nMOVE SL TO ENTRY", TP2:"✅ TAKE PROFIT 2 HIT", TP3:"🏆 TAKE PROFIT 3 HIT\nTRADE WIN", WIN:"🏆 TRADE WIN", SL:"⛔ STOP LOSS HIT", BREAK_EVEN:"🟡 BREAK-EVEN\nTRADE CLOSED AT ENTRY" };
   if (labels[event]) lines.push(labels[event]);
   for (const [label, value] of [["ENTRY",payload.entry ?? payload.entryPrice],["SL",payload.sl ?? payload.stopLoss],["TP1",payload.tp1],["TP2",payload.tp2],["TP3",payload.tp3],["PRICE",payload.price ?? payload.close]]) if (clean(value)) lines.push(`${label}: ${clean(value)}`);
@@ -177,7 +187,7 @@ async function candles(symbol) {
     }
     throw new Error(message);
   }
-  return data.values.map(v => ({ datetime:v.datetime, open:Number(v.open), high:Number(v.high), low:Number(v.low), close:Number(v.close) })).filter(v => Number.isFinite(v.close));
+  return data.values.map(v => ({ datetime:v.datetime, open:Number(v.open), high:Number(v.high), low:Number(v.low), close:Number(v.close) })).filter(v => Number.isFinite(v.close) && isClosedM5Candle(v.datetime));
 }
 
 function aggregateTo15m(candles5m) {
@@ -235,7 +245,7 @@ async function updateTrade(symbol, analysis) {
   if (!trade && ["BUY","SELL"].includes(analysis.signal) && analysis.confirmed) {
     const cooldown = Date.now() - (lastSignalAt.get(symbol) || 0);
     if (cooldown >= SIGNAL_COOLDOWN_MS) {
-      trade = { symbol, direction:analysis.signal, timeframe:"M5 + M15", confidence:analysis.confidence, status:"OPEN", createdAt:new Date().toISOString(), ...analysis.levels };
+      trade = { symbol, direction:analysis.signal, timeframe:"M5 + M15", setupType:analysis.setupType, confidence:analysis.confidence, status:"OPEN", createdAt:new Date().toISOString(), ...analysis.levels };
       liveTrades.set(symbol, trade); lastSignalAt.set(symbol, Date.now());
       await notifyEvent(trade.direction, symbol, trade);
     }
@@ -259,9 +269,12 @@ async function analyseAsset(symbol) {
   const m5 = analyse(m5Candles), m15 = analyse(m15Candles);
   const same = m5.signal !== "WAIT" && m5.signal === m15.signal;
   const notOpposite = m5.signal !== "WAIT" && (m15.signal === "WAIT" || m5.signal === m15.signal);
-  const signal = same || (notOpposite && m5.confidence >= 75) ? m5.signal : "WAIT";
-  const confidence = signal === "WAIT" ? Math.round((m5.confidence + m15.confidence)/2) : Math.min(95, Math.round(m5.confidence*0.6 + m15.confidence*0.4));
-  const result = { symbol, name:symbolLabel(symbol), price:m5.price, signal, confidence, status:signal === "WAIT" ? "WAIT" : "CONFIRMED", confirmed:signal !== "WAIT", m5:{...m5}, m15:{...m15}, timeframes:{ M5:m5, M15:m15 } };
+  const candidateSignal = same || (notOpposite && m5.confidence >= 75) ? m5.signal : "WAIT";
+  const confidence = candidateSignal === "WAIT" ? Math.round((m5.confidence + m15.confidence)/2) : Math.min(95, Math.round(m5.confidence*0.6 + m15.confidence*0.4));
+  const signal = candidateSignal !== "WAIT" && confidence >= MIN_SIGNAL_SCORE ? candidateSignal : "WAIT";
+  const setupType = signal === "WAIT" ? "WAIT" : same ? "M5 + M15 CONFIRMED" : "FAST M5 · M15 NEUTRAL";
+  const setupReason = signal !== "WAIT" ? "" : candidateSignal !== "WAIT" ? `Score below minimum ${MIN_SIGNAL_SCORE}` : m5.signal !== "WAIT" && m15.signal !== "WAIT" ? "M5 and M15 disagree" : "Waiting for a clear M5 setup and M15 confirmation";
+  const result = { symbol, name:symbolLabel(symbol), price:m5.price, signal, confidence, setupType, setupReason, status:signal === "WAIT" ? "WAIT" : "CONFIRMED", confirmed:signal !== "WAIT", m5:{...m5}, m15:{...m15}, timeframes:{ M5:m5, M15:m15 } };
   result.levels = signal === "WAIT" ? {} : levels(symbol,signal,m5.price,m5.atr);
   result.trade = await updateTrade(symbol,result);
   return result;
@@ -274,14 +287,14 @@ async function performScan() {
     const symbol = i === 0 ? "XAUUSD" : "BTCUSD";
     assets[symbol] = settled[i].status === "fulfilled" ? settled[i].value : { symbol, name:symbolLabel(symbol), signal:"WAIT", confidence:0, status:"ERROR", error:settled[i].reason?.message || "Data unavailable", timeframes:{} };
   }
-  return { ok:true, version:"8.11 FAST TP1", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
+  return { ok:true, version:"8.12 QUALITY GATE", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
 }
 
 async function getScan(force = false) {
   if (dailyLimitResetAt > Date.now()) {
     if (scanCache) return scanCache;
     const error = `Twelve Data daily credits exhausted. Retry after ${new Date(dailyLimitResetAt).toISOString()}.`;
-    return { ok:true, version:"8.11 FAST TP1", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
+    return { ok:true, version:"8.12 QUALITY GATE", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
       XAUUSD:{symbol:"XAUUSD",name:"GOLD",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}},
       BTCUSD:{symbol:"BTCUSD",name:"BITCOIN",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}}
     }};
@@ -303,9 +316,9 @@ app.get("/health", (req,res) => {
   const dailyLimit = dailyLimitResetAt > Date.now();
   const fresh = lastSuccessfulScanAt > 0 && Date.now() - lastSuccessfulScanAt < SCAN_CACHE_MS * 2;
   const marketDataStatus = !TWELVE_DATA_API_KEY ? "NOT_CONFIGURED" : dailyLimit ? "DAILY_LIMIT" : fresh ? "CONNECTED" : scanCache ? "UNAVAILABLE" : "CHECKING";
-  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.11 FAST TP1", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
+  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.12 QUALITY GATE", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
 });
-app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.11 FAST TP1", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
+app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.12 QUALITY GATE", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
 app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan()); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
 app.get("/api/test-telegram", async (req,res) => {
   try {
@@ -349,7 +362,7 @@ async function tradingViewWebhook(req,res) {
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
 app.listen(PORT,"0.0.0.0",() => {
-  console.log(`BIT ADAMS 8.11 FAST TP1 running on port ${PORT}`);
+  console.log(`BIT ADAMS 8.12 QUALITY GATE running on port ${PORT}`);
   getScan(true).catch(error => console.error("Initial scan error:", error.message));
   setInterval(() => {
     getScan(true).catch(error => console.error("Background scan error:", error.message));
