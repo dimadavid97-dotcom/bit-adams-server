@@ -13,8 +13,9 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const SCAN_CACHE_MS = 5 * 60_000;
-const SIGNAL_COOLDOWN_MS = 15 * 60_000;
-const MIN_SIGNAL_SCORE = 68;
+const SIGNAL_COOLDOWN_MS = 30 * 60_000;
+const LOSS_COOLDOWN_MS = 2 * 60 * 60_000;
+const MIN_SIGNAL_SCORE = 75;
 const BACKGROUND_SCAN_MS = 5 * 60_000;
 
 app.use(cors());
@@ -29,6 +30,7 @@ let lastProviderError = "";
 let lastSuccessfulScanAt = 0;
 const liveTrades = new Map();
 const lastSignalAt = new Map();
+const lastLossAt = new Map();
 
 const clean = value => value == null ? "" : String(value).trim();
 const round = (value, digits = 2) => Number(Number(value).toFixed(digits));
@@ -163,7 +165,7 @@ function analyse(candles) {
   const confidence = Math.round(Math.max(bull, bear));
   const signal = confidence >= 55 ? (bull > bear ? "BUY" : "SELL") : "WAIT";
   const latest = candles.at(-1) || {};
-  return { signal, confidence, price:last, high:latest.high, low:latest.low, ema9:lastE9, ema21:lastE21, rsi:round(r,1), atr:a, momentum:round(momentum,3) };
+  return { signal, confidence, price:last, datetime:latest.datetime, high:latest.high, low:latest.low, ema9:lastE9, ema21:lastE21, rsi:round(r,1), atr:a, momentum:round(momentum,3) };
 }
 
 function nextUtcMidnight() {
@@ -219,7 +221,16 @@ function aggregateTo15m(candles5m) {
 
 function levels(symbol, direction, price, a) {
   const digits = 2; const unit = Math.max(a, price * (symbol === "BTCUSD" ? 0.002 : 0.0008)); const buy = direction === "BUY";
-  return { entry:round(price,digits), sl:round(price + (buy ? -1.2 : 1.2)*unit,digits), tp1:round(price + (buy ? 1 : -1)*unit,digits), tp2:round(price + (buy ? 1.8 : -1.8)*unit,digits), tp3:round(price + (buy ? 2.8 : -2.8)*unit,digits) };
+  return { entry:round(price,digits), sl:round(price + (buy ? -1.5 : 1.5)*unit,digits), tp1:round(price + (buy ? 1.5 : -1.5)*unit,digits), tp2:round(price + (buy ? 2.2 : -2.2)*unit,digits), tp3:round(price + (buy ? 3 : -3)*unit,digits) };
+}
+
+function signalPauseReason(symbol) {
+  const now = Date.now();
+  const lossRemaining = LOSS_COOLDOWN_MS - (now - (lastLossAt.get(symbol) || 0));
+  if (lossRemaining > 0) return `Paused after stop loss · ${Math.ceil(lossRemaining / 60_000)} min left`;
+  const signalRemaining = SIGNAL_COOLDOWN_MS - (now - (lastSignalAt.get(symbol) || 0));
+  if (signalRemaining > 0) return `Signal cooldown · ${Math.ceil(signalRemaining / 60_000)} min left`;
+  return "";
 }
 
 async function notifyEvent(event, symbol, payload) {
@@ -244,21 +255,32 @@ async function updateTrade(symbol, analysis) {
   const low = Number.isFinite(analysis.m5?.low) ? analysis.m5.low : price;
   if (!trade && ["BUY","SELL"].includes(analysis.signal) && analysis.confirmed) {
     const cooldown = Date.now() - (lastSignalAt.get(symbol) || 0);
-    if (cooldown >= SIGNAL_COOLDOWN_MS) {
-      trade = { symbol, direction:analysis.signal, timeframe:"M5 + M15", setupType:analysis.setupType, confidence:analysis.confidence, status:"OPEN", createdAt:new Date().toISOString(), ...analysis.levels };
+    const lossCooldown = Date.now() - (lastLossAt.get(symbol) || 0);
+    if (cooldown >= SIGNAL_COOLDOWN_MS && lossCooldown >= LOSS_COOLDOWN_MS) {
+      trade = { symbol, direction:analysis.signal, timeframe:"M5 + M15", setupType:analysis.setupType, confidence:analysis.confidence, status:"OPEN", createdAt:new Date().toISOString(), openedOnCandle:analysis.m5?.datetime || null, ...analysis.levels };
       liveTrades.set(symbol, trade); lastSignalAt.set(symbol, Date.now());
       await notifyEvent(trade.direction, symbol, trade);
+      // Do not test the just-closed signal candle against levels calculated from its close.
+      return trade;
     }
   }
   if (!trade) return null;
+  if (trade.openedOnCandle && analysis.m5?.datetime === trade.openedOnCandle) return trade;
   const buy = trade.direction === "BUY"; const hit = target => buy ? high >= target : low <= target; const stopped = buy ? low <= trade.sl : high >= trade.sl;
   let event = "";
-  if (trade.status === "OPEN" && hit(trade.tp1)) { trade.status="TP1"; trade.sl=trade.entry; event="TP1"; }
+  if (["OPEN","TP1","TP2"].includes(trade.status) && stopped) {
+    trade.status = trade.status === "OPEN" ? "LOST" : "BREAK-EVEN";
+    event = trade.status === "LOST" ? "SL" : "BREAK_EVEN";
+  }
+  else if (trade.status === "OPEN" && hit(trade.tp1)) { trade.status="TP1"; trade.sl=trade.entry; event="TP1"; }
   else if (trade.status === "TP1" && hit(trade.tp2)) { trade.status="TP2"; event="TP2"; }
   else if (["OPEN","TP1","TP2"].includes(trade.status) && hit(trade.tp3)) { trade.status="WIN"; event="TP3"; }
-  else if (["OPEN","TP1","TP2"].includes(trade.status) && stopped) { trade.status = trade.status === "OPEN" ? "LOST" : "BREAK-EVEN"; event = trade.status === "LOST" ? "SL" : "BREAK_EVEN"; }
   if (event) await notifyEvent(event, symbol, { ...trade, price });
-  if (["WIN","LOST","BREAK-EVEN"].includes(trade.status)) { trade.closedAt=new Date().toISOString(); liveTrades.delete(symbol); }
+  if (["WIN","LOST","BREAK-EVEN"].includes(trade.status)) {
+    trade.closedAt=new Date().toISOString();
+    if (trade.status === "LOST") lastLossAt.set(symbol, Date.now());
+    liveTrades.delete(symbol);
+  }
   return trade;
 }
 
@@ -268,15 +290,43 @@ async function analyseAsset(symbol) {
   if (m15Candles.length < 22) throw new Error("Not enough completed candles to confirm M15 conditions");
   const m5 = analyse(m5Candles), m15 = analyse(m15Candles);
   const same = m5.signal !== "WAIT" && m5.signal === m15.signal;
-  const notOpposite = m5.signal !== "WAIT" && (m15.signal === "WAIT" || m5.signal === m15.signal);
-  const candidateSignal = same || (notOpposite && m5.confidence >= 75) ? m5.signal : "WAIT";
+  const candidateSignal = same ? m5.signal : "WAIT";
   const confidence = candidateSignal === "WAIT" ? Math.round((m5.confidence + m15.confidence)/2) : Math.min(95, Math.round(m5.confidence*0.6 + m15.confidence*0.4));
-  const signal = candidateSignal !== "WAIT" && confidence >= MIN_SIGNAL_SCORE ? candidateSignal : "WAIT";
-  const setupType = signal === "WAIT" ? "WAIT" : same ? "M5 + M15 CONFIRMED" : "FAST M5 · M15 NEUTRAL";
-  const setupReason = signal !== "WAIT" ? "" : candidateSignal !== "WAIT" ? `Score below minimum ${MIN_SIGNAL_SCORE}` : m5.signal !== "WAIT" && m15.signal !== "WAIT" ? "M5 and M15 disagree" : "Waiting for a clear M5 setup and M15 confirmation";
+  let signal = candidateSignal !== "WAIT" && confidence >= MIN_SIGNAL_SCORE ? candidateSignal : "WAIT";
+  let setupReason = "";
+  if (signal === "WAIT") {
+    setupReason = candidateSignal !== "WAIT" ? `Score below minimum ${MIN_SIGNAL_SCORE}` : m5.signal !== "WAIT" && m15.signal !== "WAIT" ? "M5 and M15 disagree" : "Waiting for M5 + M15 closed-candle confirmation";
+  }
+  if (signal === "BUY" && (m5.rsi > 68 || m15.rsi > 72 || m5.price - m5.ema9 > m5.atr * 1.25)) {
+    signal = "WAIT";
+    setupReason = "BUY extended or overbought — wait for pullback";
+  }
+  if (signal === "SELL" && (m5.rsi < 32 || m15.rsi < 28 || m5.ema9 - m5.price > m5.atr * 1.25)) {
+    signal = "WAIT";
+    setupReason = "SELL extended or oversold — wait for pullback";
+  }
+  if (signal !== "WAIT" && !liveTrades.has(symbol)) {
+    const pauseReason = signalPauseReason(symbol);
+    if (pauseReason) {
+      signal = "WAIT";
+      setupReason = pauseReason;
+    }
+  }
+  const setupType = signal === "WAIT" ? "WAIT" : "M5 + M15 CLOSED CONFIRMATION";
   const result = { symbol, name:symbolLabel(symbol), price:m5.price, signal, confidence, setupType, setupReason, status:signal === "WAIT" ? "WAIT" : "CONFIRMED", confirmed:signal !== "WAIT", m5:{...m5}, m15:{...m15}, timeframes:{ M5:m5, M15:m15 } };
   result.levels = signal === "WAIT" ? {} : levels(symbol,signal,m5.price,m5.atr);
   result.trade = await updateTrade(symbol,result);
+  if (!liveTrades.has(symbol)) {
+    const pauseReason = signalPauseReason(symbol);
+    if (pauseReason && ["BUY","SELL"].includes(result.signal)) {
+      result.signal = "WAIT";
+      result.status = "WAIT";
+      result.confirmed = false;
+      result.setupType = "WAIT";
+      result.setupReason = pauseReason;
+      result.levels = {};
+    }
+  }
   return result;
 }
 
@@ -287,14 +337,14 @@ async function performScan() {
     const symbol = i === 0 ? "XAUUSD" : "BTCUSD";
     assets[symbol] = settled[i].status === "fulfilled" ? settled[i].value : { symbol, name:symbolLabel(symbol), signal:"WAIT", confidence:0, status:"ERROR", error:settled[i].reason?.message || "Data unavailable", timeframes:{} };
   }
-  return { ok:true, version:"8.13 DAILY QUOTA", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
+  return { ok:true, version:"8.14 CLOSED-CANDLE FILTER", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
 }
 
 async function getScan(force = false) {
   if (dailyLimitResetAt > Date.now()) {
     if (scanCache) return scanCache;
     const error = `Twelve Data daily credits exhausted. Retry after ${new Date(dailyLimitResetAt).toISOString()}.`;
-    return { ok:true, version:"8.13 DAILY QUOTA", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
+    return { ok:true, version:"8.14 CLOSED-CANDLE FILTER", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
       XAUUSD:{symbol:"XAUUSD",name:"GOLD",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}},
       BTCUSD:{symbol:"BTCUSD",name:"BITCOIN",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}}
     }};
@@ -316,9 +366,9 @@ app.get("/health", (req,res) => {
   const dailyLimit = dailyLimitResetAt > Date.now();
   const fresh = lastSuccessfulScanAt > 0 && Date.now() - lastSuccessfulScanAt < SCAN_CACHE_MS * 2;
   const marketDataStatus = !TWELVE_DATA_API_KEY ? "NOT_CONFIGURED" : dailyLimit ? "DAILY_LIMIT" : fresh ? "CONNECTED" : scanCache ? "UNAVAILABLE" : "CHECKING";
-  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.13 DAILY QUOTA", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
+  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.14 CLOSED-CANDLE FILTER", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
 });
-app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.13 DAILY QUOTA", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
+app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.14 CLOSED-CANDLE FILTER", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
 app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan()); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
 app.get("/api/test-telegram", async (req,res) => {
   try {
@@ -362,7 +412,7 @@ async function tradingViewWebhook(req,res) {
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
 app.listen(PORT,"0.0.0.0",() => {
-  console.log(`BIT ADAMS 8.13 DAILY QUOTA running on port ${PORT}`);
+  console.log(`BIT ADAMS 8.14 CLOSED-CANDLE FILTER running on port ${PORT}`);
   getScan(true).catch(error => console.error("Initial scan error:", error.message));
   setInterval(() => {
     getScan(true).catch(error => console.error("Background scan error:", error.message));
