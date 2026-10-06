@@ -29,6 +29,7 @@ let dailyLimitResetAt = 0;
 let lastProviderError = "";
 let lastSuccessfulScanAt = 0;
 const liveTrades = new Map();
+const tradeHistory = new Map();
 const lastSignalAt = new Map();
 const lastLossAt = new Map();
 
@@ -224,6 +225,18 @@ function levels(symbol, direction, price, a) {
   return { entry:round(price,digits), sl:round(price + (buy ? -1.5 : 1.5)*unit,digits), tp1:round(price + (buy ? 1.5 : -1.5)*unit,digits), tp2:round(price + (buy ? 2.2 : -2.2)*unit,digits), tp3:round(price + (buy ? 3 : -3)*unit,digits) };
 }
 
+function saveTradeSnapshot(trade) {
+  if (!trade || !trade.createdAt) return;
+  trade.updatedAt = new Date().toISOString();
+  tradeHistory.set(`${trade.symbol}:${trade.createdAt}`, { ...trade });
+}
+
+function getTradeHistory() {
+  return [...tradeHistory.values()]
+    .sort((a,b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+    .slice(0,250);
+}
+
 function signalPauseReason(symbol) {
   const now = Date.now();
   const lossRemaining = LOSS_COOLDOWN_MS - (now - (lastLossAt.get(symbol) || 0));
@@ -258,7 +271,7 @@ async function updateTrade(symbol, analysis) {
     const lossCooldown = Date.now() - (lastLossAt.get(symbol) || 0);
     if (cooldown >= SIGNAL_COOLDOWN_MS && lossCooldown >= LOSS_COOLDOWN_MS) {
       trade = { symbol, direction:analysis.signal, timeframe:"M5 + M15", setupType:analysis.setupType, confidence:analysis.confidence, status:"OPEN", createdAt:new Date().toISOString(), openedOnCandle:analysis.m5?.datetime || null, ...analysis.levels };
-      liveTrades.set(symbol, trade); lastSignalAt.set(symbol, Date.now());
+      liveTrades.set(symbol, trade); saveTradeSnapshot(trade); lastSignalAt.set(symbol, Date.now());
       await notifyEvent(trade.direction, symbol, trade);
       // Do not test the just-closed signal candle against levels calculated from its close.
       return trade;
@@ -275,10 +288,12 @@ async function updateTrade(symbol, analysis) {
   else if (trade.status === "OPEN" && hit(trade.tp1)) { trade.status="TP1"; trade.sl=trade.entry; event="TP1"; }
   else if (trade.status === "TP1" && hit(trade.tp2)) { trade.status="TP2"; event="TP2"; }
   else if (["OPEN","TP1","TP2"].includes(trade.status) && hit(trade.tp3)) { trade.status="WIN"; event="TP3"; }
-  if (event) await notifyEvent(event, symbol, { ...trade, price });
+  if (event) { saveTradeSnapshot(trade); await notifyEvent(event, symbol, { ...trade, price }); }
+  else saveTradeSnapshot(trade);
   if (["WIN","LOST","BREAK-EVEN"].includes(trade.status)) {
     trade.closedAt=new Date().toISOString();
     if (trade.status === "LOST") lastLossAt.set(symbol, Date.now());
+    saveTradeSnapshot(trade);
     liveTrades.delete(symbol);
   }
   return trade;
@@ -370,6 +385,9 @@ app.get("/health", (req,res) => {
 });
 app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.14 CLOSED-CANDLE FILTER", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
 app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan()); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
+app.get("/api/history", (req,res) => {
+  res.json({ ok:true, updatedAt:new Date().toISOString(), trades:getTradeHistory() });
+});
 app.get("/api/test-telegram", async (req,res) => {
   try {
     const telegram = await sendTelegram("✅ BIT ADAMS TEST", "Notificările Telegram funcționează.");
