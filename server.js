@@ -1,6 +1,8 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import fs from "node:fs/promises";
+import path from "node:path";
 
 dotenv.config();
 
@@ -17,6 +19,8 @@ const SIGNAL_COOLDOWN_MS = 30 * 60_000;
 const LOSS_COOLDOWN_MS = 2 * 60 * 60_000;
 const MIN_SIGNAL_SCORE = 75;
 const BACKGROUND_SCAN_MS = 5 * 60_000;
+const HISTORY_FILE = process.env.TRADE_HISTORY_FILE || "/data/bit-adams-trade-history.json";
+let historyWritePromise = Promise.resolve();
 
 app.use(cors());
 app.use(express.json({ limit: "100kb" }));
@@ -229,8 +233,39 @@ function saveTradeSnapshot(trade) {
   if (!trade || !trade.createdAt) return;
   trade.updatedAt = new Date().toISOString();
   tradeHistory.set(`${trade.symbol}:${trade.createdAt}`, { ...trade });
+  persistTradeHistory();
 }
 
+async function loadTradeHistory() {
+  try {
+    const raw = await fs.readFile(HISTORY_FILE, "utf8");
+    const saved = JSON.parse(raw);
+    const trades = Array.isArray(saved) ? saved : Array.isArray(saved?.trades) ? saved.trades : [];
+    for (const trade of trades) {
+      if (trade?.symbol && trade?.createdAt) tradeHistory.set(`${trade.symbol}:${trade.createdAt}`, trade);
+    }
+    console.log(`Loaded ${tradeHistory.size} persisted trades from ${HISTORY_FILE}`);
+  } catch (error) {
+    if (error.code !== "ENOENT") console.error("Trade history load error:", error.message);
+  }
+}
+
+function persistTradeHistory() {
+  const snapshot = getTradeHistory();
+  historyWritePromise = historyWritePromise
+    .catch(() => {})
+    .then(async () => {
+      try {
+        await fs.mkdir(path.dirname(HISTORY_FILE), { recursive: true });
+        const tempFile = `${HISTORY_FILE}.tmp`;
+        await fs.writeFile(tempFile, JSON.stringify(snapshot, null, 2), "utf8");
+        await fs.rename(tempFile, HISTORY_FILE);
+      } catch (error) {
+        console.error("Trade history persistence error:", error.message);
+      }
+    });
+  return historyWritePromise;
+}
 function getTradeHistory() {
   return [...tradeHistory.values()]
     .sort((a,b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
@@ -429,8 +464,12 @@ async function tradingViewWebhook(req,res) {
 
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
-app.listen(PORT,"0.0.0.0",() => {
+app.listen(PORT,"0.0.0.0",async () => {
   console.log(`BIT ADAMS 8.14 CLOSED-CANDLE FILTER running on port ${PORT}`);
+  await loadTradeHistory();
+  for (const trade of tradeHistory.values()) {
+    if (trade.status === "OPEN" || trade.status === "TP1" || trade.status === "TP2") liveTrades.set(trade.symbol, trade);
+  }
   getScan(true).catch(error => console.error("Initial scan error:", error.message));
   setInterval(() => {
     getScan(true).catch(error => console.error("Background scan error:", error.message));
