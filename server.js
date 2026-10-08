@@ -14,11 +14,11 @@ const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY || "";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
-const SCAN_CACHE_MS = 5 * 60_000;
-const SIGNAL_COOLDOWN_MS = 30 * 60_000;
-const LOSS_COOLDOWN_MS = 2 * 60 * 60_000;
-const MIN_SIGNAL_SCORE = 75;
-const BACKGROUND_SCAN_MS = 5 * 60_000;
+const SCAN_CACHE_MS = 2 * 60_000;
+const SIGNAL_COOLDOWN_MS = 10 * 60_000;
+const LOSS_COOLDOWN_MS = 30 * 60_000;
+const MIN_SIGNAL_SCORE = 68;
+const BACKGROUND_SCAN_MS = 2 * 60_000;
 const HISTORY_FILE = process.env.TRADE_HISTORY_FILE || "/data/bit-adams-trade-history.json";
 let historyWritePromise = Promise.resolve();
 
@@ -339,9 +339,15 @@ async function analyseAsset(symbol) {
   const m15Candles = aggregateTo15m(m5Candles);
   if (m15Candles.length < 22) throw new Error("Not enough completed candles to confirm M15 conditions");
   const m5 = analyse(m5Candles), m15 = analyse(m15Candles);
-  const same = m5.signal !== "WAIT" && m5.signal === m15.signal;
-  const candidateSignal = same ? m5.signal : "WAIT";
-  const confidence = candidateSignal === "WAIT" ? Math.round((m5.confidence + m15.confidence)/2) : Math.min(95, Math.round(m5.confidence*0.6 + m15.confidence*0.4));
+  // ACTIVE mode: M5 drives entries. M15 confirms direction when available,
+  // but a neutral M15 no longer blocks a strong M5 setup.
+  const m15SupportsBuy = m15.signal === "BUY" || m15.signal === "WAIT";
+  const m15SupportsSell = m15.signal === "SELL" || m15.signal === "WAIT";
+  const m5Strong = m5.signal !== "WAIT" && m5.confidence >= MIN_SIGNAL_SCORE;
+  const candidateSignal = m5Strong && ((m5.signal === "BUY" && m15SupportsBuy) || (m5.signal === "SELL" && m15SupportsSell)) ? m5.signal : "WAIT";
+  const confidence = candidateSignal === "WAIT"
+    ? Math.round((m5.confidence + m15.confidence)/2)
+    : Math.min(95, Math.round(m5.confidence*0.75 + m15.confidence*0.25));
   let signal = candidateSignal !== "WAIT" && confidence >= MIN_SIGNAL_SCORE ? candidateSignal : "WAIT";
   let setupReason = "";
   if (signal === "WAIT") {
@@ -387,7 +393,7 @@ async function performScan() {
     const symbol = i === 0 ? "XAUUSD" : "BTCUSD";
     assets[symbol] = settled[i].status === "fulfilled" ? settled[i].value : { symbol, name:symbolLabel(symbol), signal:"WAIT", confidence:0, status:"ERROR", error:settled[i].reason?.message || "Data unavailable", timeframes:{} };
   }
-  return { ok:true, version:"8.14 CLOSED-CANDLE FILTER", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
+  return { ok:true, version:"8.15 ACTIVE M5", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
 }
 
 async function getScan(force = false) {
@@ -465,7 +471,7 @@ async function tradingViewWebhook(req,res) {
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
 app.listen(PORT,"0.0.0.0",async () => {
-  console.log(`BIT ADAMS 8.14 CLOSED-CANDLE FILTER running on port ${PORT}`);
+  console.log(`BIT ADAMS 8.15 ACTIVE M5 running on port ${PORT}`);
   await loadTradeHistory();
   for (const trade of tradeHistory.values()) {
     if (trade.status === "OPEN" || trade.status === "TP1" || trade.status === "TP2") liveTrades.set(trade.symbol, trade);
