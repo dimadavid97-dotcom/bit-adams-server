@@ -16,8 +16,8 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const SCAN_CACHE_MS = 5 * 60_000;
 const SIGNAL_COOLDOWN_MS = 10 * 60_000;
-const LOSS_COOLDOWN_MS = 30 * 60_000;
-const MIN_SIGNAL_SCORE = 68;
+const LOSS_COOLDOWN_MS = 45 * 60_000;
+const MIN_SIGNAL_SCORE = 72;
 const BACKGROUND_SCAN_MS = 5 * 60_000;
 const HISTORY_FILE = process.env.TRADE_HISTORY_FILE || "/data/bit-adams-trade-history.json";
 let historyWritePromise = Promise.resolve();
@@ -339,10 +339,10 @@ async function analyseAsset(symbol) {
   const m15Candles = aggregateTo15m(m5Candles);
   if (m15Candles.length < 22) throw new Error("Not enough completed candles to confirm M15 conditions");
   const m5 = analyse(m5Candles), m15 = analyse(m15Candles);
-  // ACTIVE mode: M5 drives entries. M15 confirms direction when available,
-  // but a neutral M15 no longer blocks a strong M5 setup.
-  const m15SupportsBuy = m15.signal === "BUY" || m15.signal === "WAIT";
-  const m15SupportsSell = m15.signal === "SELL" || m15.signal === "WAIT";
+  // QUALITY mode: require the completed M15 candle to agree with M5.
+  // A neutral or opposing M15 signal blocks a new entry to avoid weak setups.
+  const m15SupportsBuy = m15.signal === "BUY";
+  const m15SupportsSell = m15.signal === "SELL";
   const m5Strong = m5.signal !== "WAIT" && m5.confidence >= MIN_SIGNAL_SCORE;
   const candidateSignal = m5Strong && ((m5.signal === "BUY" && m15SupportsBuy) || (m5.signal === "SELL" && m15SupportsSell)) ? m5.signal : "WAIT";
   const confidence = candidateSignal === "WAIT"
