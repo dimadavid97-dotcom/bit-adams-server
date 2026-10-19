@@ -14,11 +14,11 @@ const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY || "";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
-const SCAN_CACHE_MS = 2 * 60_000;
+const SCAN_CACHE_MS = 5 * 60_000;
 const SIGNAL_COOLDOWN_MS = 10 * 60_000;
 const LOSS_COOLDOWN_MS = 30 * 60_000;
 const MIN_SIGNAL_SCORE = 68;
-const BACKGROUND_SCAN_MS = 2 * 60_000;
+const BACKGROUND_SCAN_MS = 5 * 60_000;
 const HISTORY_FILE = process.env.TRADE_HISTORY_FILE || "/data/bit-adams-trade-history.json";
 let historyWritePromise = Promise.resolve();
 
