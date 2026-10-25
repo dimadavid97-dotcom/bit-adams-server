@@ -17,7 +17,7 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const SCAN_CACHE_MS = 5 * 60_000;
 const SIGNAL_COOLDOWN_MS = 10 * 60_000;
 const LOSS_COOLDOWN_MS = 45 * 60_000;
-const MIN_SIGNAL_SCORE = 72;
+const MIN_SIGNAL_SCORE = 68;
 const BACKGROUND_SCAN_MS = 5 * 60_000;
 const HISTORY_FILE = process.env.TRADE_HISTORY_FILE || "/data/bit-adams-trade-history.json";
 let historyWritePromise = Promise.resolve();
@@ -55,6 +55,13 @@ function normalizeSymbol(value) {
 }
 
 const symbolLabel = symbol => symbol === "XAUUSD" ? "GOLD" : symbol === "BTCUSD" ? "BITCOIN" : symbol;
+
+function isSignalWindowOpen(date = new Date()) {
+  // UK local time follows GMT/BST automatically.
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone:"Europe/London", hour:"2-digit", minute:"2-digit", hourCycle:"h23" }).formatToParts(date);
+  const hour = Number(parts.find(part => part.type === "hour")?.value ?? 0);
+  return hour >= 8 && hour < 20;
+}
 
 function isClosedM5Candle(datetime) {
   const value = String(datetime || "").trim().replace(" ", "T");
@@ -320,9 +327,9 @@ async function updateTrade(symbol, analysis) {
     trade.status = trade.status === "OPEN" ? "LOST" : "BREAK-EVEN";
     event = trade.status === "LOST" ? "SL" : "BREAK_EVEN";
   }
-  else if (trade.status === "OPEN" && hit(trade.tp1)) { trade.status="TP1"; trade.sl=trade.entry; event="TP1"; }
-  else if (trade.status === "TP1" && hit(trade.tp2)) { trade.status="TP2"; event="TP2"; }
   else if (["OPEN","TP1","TP2"].includes(trade.status) && hit(trade.tp3)) { trade.status="WIN"; event="TP3"; }
+  else if (["OPEN","TP1"].includes(trade.status) && hit(trade.tp2)) { trade.status="TP2"; trade.sl=trade.entry; event="TP2"; }
+  else if (trade.status === "OPEN" && hit(trade.tp1)) { trade.status="TP1"; trade.sl=trade.entry; event="TP1"; }
   if (event) { saveTradeSnapshot(trade); await notifyEvent(event, symbol, { ...trade, price }); }
   else saveTradeSnapshot(trade);
   if (["WIN","LOST","BREAK-EVEN"].includes(trade.status)) {
@@ -368,6 +375,10 @@ async function analyseAsset(symbol) {
       setupReason = pauseReason;
     }
   }
+  if (signal !== "WAIT" && !isSignalWindowOpen()) {
+    signal = "WAIT";
+    setupReason = "Signal schedule is 08:00–20:00 UK time";
+  }
   const setupType = signal === "WAIT" ? "WAIT" : "M5 + M15 CLOSED CONFIRMATION";
   const result = { symbol, name:symbolLabel(symbol), price:m5.price, signal, confidence, setupType, setupReason, status:signal === "WAIT" ? "WAIT" : "CONFIRMED", confirmed:signal !== "WAIT", m5:{...m5}, m15:{...m15}, timeframes:{ M5:m5, M15:m15 } };
   result.levels = signal === "WAIT" ? {} : levels(symbol,signal,m5.price,m5.atr);
@@ -393,14 +404,14 @@ async function performScan() {
     const symbol = i === 0 ? "XAUUSD" : "BTCUSD";
     assets[symbol] = settled[i].status === "fulfilled" ? settled[i].value : { symbol, name:symbolLabel(symbol), signal:"WAIT", confidence:0, status:"ERROR", error:settled[i].reason?.message || "Data unavailable", timeframes:{} };
   }
-  return { ok:true, version:"8.15 ACTIVE M5", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
+  return { ok:true, version:"8.16 UK HOURS + HISTORY FIX", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
 }
 
 async function getScan(force = false) {
   if (dailyLimitResetAt > Date.now()) {
     if (scanCache) return scanCache;
     const error = `Twelve Data daily credits exhausted. Retry after ${new Date(dailyLimitResetAt).toISOString()}.`;
-    return { ok:true, version:"8.14 CLOSED-CANDLE FILTER", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
+    return { ok:true, version:"8.16 UK HOURS + HISTORY FIX", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
       XAUUSD:{symbol:"XAUUSD",name:"GOLD",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}},
       BTCUSD:{symbol:"BTCUSD",name:"BITCOIN",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}}
     }};
@@ -471,7 +482,7 @@ async function tradingViewWebhook(req,res) {
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
 app.listen(PORT,"0.0.0.0",async () => {
-  console.log(`BIT ADAMS 8.15 ACTIVE M5 running on port ${PORT}`);
+  console.log(`BIT ADAMS 8.16 UK HOURS + HISTORY FIX running on port ${PORT}`);
   await loadTradeHistory();
   for (const trade of tradeHistory.values()) {
     if (trade.status === "OPEN" || trade.status === "TP1" || trade.status === "TP2") liveTrades.set(trade.symbol, trade);
