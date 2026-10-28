@@ -232,8 +232,18 @@ function aggregateTo15m(candles5m) {
 }
 
 function levels(symbol, direction, price, a) {
-  const digits = 2; const unit = Math.max(a, price * (symbol === "BTCUSD" ? 0.002 : 0.0008)); const buy = direction === "BUY";
-  return { entry:round(price,digits), sl:round(price + (buy ? -1.5 : 1.5)*unit,digits), tp1:round(price + (buy ? 1.5 : -1.5)*unit,digits), tp2:round(price + (buy ? 2.2 : -2.2)*unit,digits), tp3:round(price + (buy ? 3 : -3)*unit,digits) };
+  // Give trades more room against normal M5 noise; targets remain ATR-based.
+  const digits = 2;
+  const unit = Math.max(a, price * (symbol === "BTCUSD" ? 0.002 : 0.0008));
+  const buy = direction === "BUY";
+  const stopDistance = 1.8 * unit;
+  return {
+    entry:round(price,digits),
+    sl:round(price + (buy ? -stopDistance : stopDistance),digits),
+    tp1:round(price + (buy ? 1.8 : -1.8)*unit,digits),
+    tp2:round(price + (buy ? 2.6 : -2.6)*unit,digits),
+    tp3:round(price + (buy ? 3.5 : -3.5)*unit,digits)
+  };
 }
 
 function saveTradeSnapshot(trade) {
@@ -357,17 +367,22 @@ async function analyseAsset(symbol) {
       ? "Not enough completed M15 candles to confirm the M5 signal"
       : `M15 does not confirm the M5 ${m5.signal} direction`;
   }
+  const candleRange = Math.max(0, Number(latest.high) - Number(latest.low));
+  const candleBody = Math.abs(Number(latest.close) - Number(latest.open));
+  const bodyRatio = candleRange > 0 ? candleBody / candleRange : 0;
   const buyCandle = Number(latest.close) > Number(latest.open);
   const sellCandle = Number(latest.close) < Number(latest.open);
-  const nearTrend = m5.atr > 0 && Math.abs(m5.price - m5.ema9) <= m5.atr * 1.2;
-  const buyMomentum = m5.rsi >= 50 && m5.rsi <= 68 && m5.momentum > 0;
-  const sellMomentum = m5.rsi <= 50 && m5.rsi >= 32 && m5.momentum < 0;
-  if (signal === "BUY" && (m5.confidence < MIN_SIGNAL_SCORE || !buyCandle || !buyMomentum || !nearTrend)) {
+  const nearTrend = m5.atr > 0 && Math.abs(m5.price - m5.ema9) <= m5.atr * 1.0;
+  // Avoid weak/doji candles and entries when RSI is already stretched.
+  const cleanCandle = bodyRatio >= 0.35;
+  const buyMomentum = m5.rsi >= 52 && m5.rsi <= 65 && m5.momentum > 0;
+  const sellMomentum = m5.rsi <= 48 && m5.rsi >= 35 && m5.momentum < 0;
+  if (signal === "BUY" && (m5.confidence < MIN_SIGNAL_SCORE || !buyCandle || !cleanCandle || !buyMomentum || !nearTrend)) {
     signal = "WAIT";
-    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !buyCandle ? "Wait for a completed bullish M5 candle" : !buyMomentum ? "BUY momentum is not clean — wait" : "Price too extended from EMA9 — wait for pullback";
-  } else if (signal === "SELL" && (m5.confidence < MIN_SIGNAL_SCORE || !sellCandle || !sellMomentum || !nearTrend)) {
+    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !buyCandle ? "Wait for a completed bullish M5 candle" : !cleanCandle ? "M5 candle is weak/doji — wait for a stronger close" : !buyMomentum ? "BUY momentum/RSI is not ideal — wait" : "Price too extended from EMA9 — wait for pullback";
+  } else if (signal === "SELL" && (m5.confidence < MIN_SIGNAL_SCORE || !sellCandle || !cleanCandle || !sellMomentum || !nearTrend)) {
     signal = "WAIT";
-    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !sellCandle ? "Wait for a completed bearish M5 candle" : !sellMomentum ? "SELL momentum is not clean — wait" : "Price too extended from EMA9 — wait for pullback";
+    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !sellCandle ? "Wait for a completed bearish M5 candle" : !cleanCandle ? "M5 candle is weak/doji — wait for a stronger close" : !sellMomentum ? "SELL momentum/RSI is not ideal — wait" : "Price too extended from EMA9 — wait for pullback";
   } else if (signal === "WAIT") {
     setupReason = "Waiting for clear M5 trend and momentum";
   }
