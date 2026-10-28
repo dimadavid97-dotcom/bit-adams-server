@@ -432,9 +432,9 @@ app.get("/health", (req,res) => {
   const dailyLimit = dailyLimitResetAt > Date.now();
   const fresh = lastSuccessfulScanAt > 0 && Date.now() - lastSuccessfulScanAt < SCAN_CACHE_MS * 2;
   const marketDataStatus = !TWELVE_DATA_API_KEY ? "NOT_CONFIGURED" : dailyLimit ? "DAILY_LIMIT" : fresh ? "CONNECTED" : scanCache ? "UNAVAILABLE" : "CHECKING";
-  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.14 CLOSED-CANDLE FILTER", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
+  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.17 M5 QUALITY FILTER", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
 });
-app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.14 CLOSED-CANDLE FILTER", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
+app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.17 M5 QUALITY FILTER", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
 app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan()); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
 app.get("/api/history", (req,res) => {
   res.json({ ok:true, updatedAt:new Date().toISOString(), trades:getTradeHistory() });
