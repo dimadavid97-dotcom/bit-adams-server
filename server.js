@@ -17,7 +17,7 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const SCAN_CACHE_MS = 5 * 60_000;
 const SIGNAL_COOLDOWN_MS = 10 * 60_000;
 const LOSS_COOLDOWN_MS = 45 * 60_000;
-const MIN_SIGNAL_SCORE = 68;
+const MIN_SIGNAL_SCORE = 75;
 const BACKGROUND_SCAN_MS = 5 * 60_000;
 const HISTORY_FILE = process.env.TRADE_HISTORY_FILE || "/data/bit-adams-trade-history.json";
 let historyWritePromise = Promise.resolve();
@@ -177,7 +177,7 @@ function analyse(candles) {
   const confidence = Math.round(Math.max(bull, bear));
   const signal = confidence >= 55 ? (bull > bear ? "BUY" : "SELL") : "WAIT";
   const latest = candles.at(-1) || {};
-  return { signal, confidence, price:last, datetime:latest.datetime, high:latest.high, low:latest.low, ema9:lastE9, ema21:lastE21, rsi:round(r,1), atr:a, momentum:round(momentum,3) };
+  return { signal, confidence, price:last, datetime:latest.datetime, open:latest.open, high:latest.high, low:latest.low, ema9:lastE9, ema21:lastE21, rsi:round(r,1), atr:a, momentum:round(momentum,3) };
 }
 
 function nextUtcMidnight() {
@@ -312,7 +312,7 @@ async function updateTrade(symbol, analysis) {
     const cooldown = Date.now() - (lastSignalAt.get(symbol) || 0);
     const lossCooldown = Date.now() - (lastLossAt.get(symbol) || 0);
     if (cooldown >= SIGNAL_COOLDOWN_MS && lossCooldown >= LOSS_COOLDOWN_MS) {
-      trade = { symbol, direction:analysis.signal, timeframe:"M5 + M15", setupType:analysis.setupType, confidence:analysis.confidence, status:"OPEN", createdAt:new Date().toISOString(), openedOnCandle:analysis.m5?.datetime || null, ...analysis.levels };
+      trade = { symbol, direction:analysis.signal, timeframe:"M5", setupType:analysis.setupType, confidence:analysis.confidence, status:"OPEN", createdAt:new Date().toISOString(), openedOnCandle:analysis.m5?.datetime || null, ...analysis.levels };
       liveTrades.set(symbol, trade); saveTradeSnapshot(trade); lastSignalAt.set(symbol, Date.now());
       await notifyEvent(trade.direction, symbol, trade);
       // Do not test the just-closed signal candle against levels calculated from its close.
@@ -342,31 +342,26 @@ async function updateTrade(symbol, analysis) {
 }
 
 async function analyseAsset(symbol) {
+  // M5-only mode: all decisions use completed 5-minute candles.
   const m5Candles = await candles(symbol);
-  const m15Candles = aggregateTo15m(m5Candles);
-  if (m15Candles.length < 22) throw new Error("Not enough completed candles to confirm M15 conditions");
-  const m5 = analyse(m5Candles), m15 = analyse(m15Candles);
-  // QUALITY mode: require the completed M15 candle to agree with M5.
-  // A neutral or opposing M15 signal blocks a new entry to avoid weak setups.
-  const m15SupportsBuy = m15.signal === "BUY";
-  const m15SupportsSell = m15.signal === "SELL";
-  const m5Strong = m5.signal !== "WAIT" && m5.confidence >= MIN_SIGNAL_SCORE;
-  const candidateSignal = m5Strong && ((m5.signal === "BUY" && m15SupportsBuy) || (m5.signal === "SELL" && m15SupportsSell)) ? m5.signal : "WAIT";
-  const confidence = candidateSignal === "WAIT"
-    ? Math.round((m5.confidence + m15.confidence)/2)
-    : Math.min(95, Math.round(m5.confidence*0.75 + m15.confidence*0.25));
-  let signal = candidateSignal !== "WAIT" && confidence >= MIN_SIGNAL_SCORE ? candidateSignal : "WAIT";
+  if (m5Candles.length < 30) throw new Error("Not enough completed M5 candles");
+  const m5 = analyse(m5Candles);
+  const latest = m5Candles.at(-1);
+  let signal = m5.signal;
   let setupReason = "";
-  if (signal === "WAIT") {
-    setupReason = candidateSignal !== "WAIT" ? `Score below minimum ${MIN_SIGNAL_SCORE}` : m5.signal !== "WAIT" && m15.signal !== "WAIT" ? "M5 and M15 disagree" : "Waiting for M5 + M15 closed-candle confirmation";
-  }
-  if (signal === "BUY" && (m5.rsi > 68 || m15.rsi > 72 || m5.price - m5.ema9 > m5.atr * 1.25)) {
+  const buyCandle = Number(latest.close) > Number(latest.open);
+  const sellCandle = Number(latest.close) < Number(latest.open);
+  const nearTrend = m5.atr > 0 && Math.abs(m5.price - m5.ema9) <= m5.atr * 1.2;
+  const buyMomentum = m5.rsi >= 50 && m5.rsi <= 68 && m5.momentum > 0;
+  const sellMomentum = m5.rsi <= 50 && m5.rsi >= 32 && m5.momentum < 0;
+  if (signal === "BUY" && (m5.confidence < MIN_SIGNAL_SCORE || !buyCandle || !buyMomentum || !nearTrend)) {
     signal = "WAIT";
-    setupReason = "BUY extended or overbought — wait for pullback";
-  }
-  if (signal === "SELL" && (m5.rsi < 32 || m15.rsi < 28 || m5.ema9 - m5.price > m5.atr * 1.25)) {
+    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !buyCandle ? "Wait for a completed bullish M5 candle" : !buyMomentum ? "BUY momentum is not clean — wait" : "Price too extended from EMA9 — wait for pullback";
+  } else if (signal === "SELL" && (m5.confidence < MIN_SIGNAL_SCORE || !sellCandle || !sellMomentum || !nearTrend)) {
     signal = "WAIT";
-    setupReason = "SELL extended or oversold — wait for pullback";
+    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !sellCandle ? "Wait for a completed bearish M5 candle" : !sellMomentum ? "SELL momentum is not clean — wait" : "Price too extended from EMA9 — wait for pullback";
+  } else if (signal === "WAIT") {
+    setupReason = "Waiting for clear M5 trend and momentum";
   }
   if (signal !== "WAIT" && !liveTrades.has(symbol)) {
     const pauseReason = signalPauseReason(symbol);
@@ -379,8 +374,12 @@ async function analyseAsset(symbol) {
     signal = "WAIT";
     setupReason = "Signal schedule is 08:00–20:00 UK time";
   }
-  const setupType = signal === "WAIT" ? "WAIT" : "M5 + M15 CLOSED CONFIRMATION";
-  const result = { symbol, name:symbolLabel(symbol), price:m5.price, signal, confidence, setupType, setupReason, status:signal === "WAIT" ? "WAIT" : "CONFIRMED", confirmed:signal !== "WAIT", m5:{...m5}, m15:{...m15}, timeframes:{ M5:m5, M15:m15 } };
+  const setupType = signal === "WAIT" ? "WAIT" : "M5 CLOSED-CANDLE CONFIRMATION";
+  const result = {
+    symbol, name:symbolLabel(symbol), price:m5.price, signal, confidence:m5.confidence,
+    setupType, setupReason, status:signal === "WAIT" ? "WAIT" : "CONFIRMED",
+    confirmed:signal !== "WAIT", m5, timeframes:{ M5:m5 }
+  };
   result.levels = signal === "WAIT" ? {} : levels(symbol,signal,m5.price,m5.atr);
   result.trade = await updateTrade(symbol,result);
   if (!liveTrades.has(symbol)) {
@@ -404,7 +403,7 @@ async function performScan() {
     const symbol = i === 0 ? "XAUUSD" : "BTCUSD";
     assets[symbol] = settled[i].status === "fulfilled" ? settled[i].value : { symbol, name:symbolLabel(symbol), signal:"WAIT", confidence:0, status:"ERROR", error:settled[i].reason?.message || "Data unavailable", timeframes:{} };
   }
-  return { ok:true, version:"8.16 UK HOURS + HISTORY FIX", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
+  return { ok:true, version:"8.17 M5 QUALITY FILTER", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
 }
 
 async function getScan(force = false) {
@@ -482,7 +481,7 @@ async function tradingViewWebhook(req,res) {
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
 app.listen(PORT,"0.0.0.0",async () => {
-  console.log(`BIT ADAMS 8.16 UK HOURS + HISTORY FIX running on port ${PORT}`);
+  console.log(`BIT ADAMS 8.17 M5 QUALITY FILTER running on port ${PORT}`);
   await loadTradeHistory();
   for (const trade of tradeHistory.values()) {
     if (trade.status === "OPEN" || trade.status === "TP1" || trade.status === "TP2") liveTrades.set(trade.symbol, trade);
