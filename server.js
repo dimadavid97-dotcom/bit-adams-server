@@ -356,17 +356,10 @@ async function analyseAsset(symbol) {
   const m5Candles = await candles(symbol);
   if (m5Candles.length < 30) throw new Error("Not enough completed M5 candles");
   const m5 = analyse(m5Candles);
-  const m15Candles = aggregateTo15m(m5Candles);
-  const m15 = m15Candles.length >= 15 ? analyse(m15Candles) : null;
   const latest = m5Candles.at(-1);
+  // M5 ONLY: M15 is deliberately not used to block, delay, or approve entries.
   let signal = m5.signal;
   let setupReason = "";
-  if (signal !== "WAIT" && (!m15 || m15.signal !== signal || m15.confidence < MIN_SIGNAL_SCORE)) {
-    signal = "WAIT";
-    setupReason = !m15
-      ? "Not enough completed M15 candles to confirm the M5 signal"
-      : `M15 does not confirm the M5 ${m5.signal} direction`;
-  }
   const candleRange = Math.max(0, Number(latest.high) - Number(latest.low));
   const candleBody = Math.abs(Number(latest.close) - Number(latest.open));
   const bodyRatio = candleRange > 0 ? candleBody / candleRange : 0;
@@ -401,12 +394,12 @@ async function analyseAsset(symbol) {
     signal = "WAIT";
     setupReason = "Trade already open — monitoring TP/SL; no duplicate entry";
   }
-  const setupType = signal === "WAIT" ? "WAIT" : "M5 + M15 CLOSED-CANDLE CONFIRMATION";
+  const setupType = signal === "WAIT" ? "WAIT" : "M5 CLOSED-CANDLE CONFIRMATION";
   const result = {
     symbol, name:symbolLabel(symbol), price:m5.price, signal,
-    confidence:signal === "WAIT" ? 0 : Math.min(m5.confidence, m15?.confidence ?? 0),
+    confidence:signal === "WAIT" ? 0 : m5.confidence,
     setupType, setupReason, status:signal === "WAIT" ? "WAIT" : "CONFIRMED",
-    confirmed:signal !== "WAIT", m5, timeframes:{ M5:m5, ...(m15 ? { M15:m15 } : {}) }
+    confirmed:signal !== "WAIT", m5, timeframes:{ M5:m5 }
   };
   result.levels = signal === "WAIT" ? {} : levels(symbol,signal,m5.price,m5.atr);
   result.trade = await updateTrade(symbol,result);
@@ -431,14 +424,14 @@ async function performScan() {
     const symbol = i === 0 ? "XAUUSD" : "BTCUSD";
     assets[symbol] = settled[i].status === "fulfilled" ? settled[i].value : { symbol, name:symbolLabel(symbol), signal:"WAIT", confidence:0, status:"ERROR", error:settled[i].reason?.message || "Data unavailable", timeframes:{} };
   }
-  return { ok:true, version:"8.19 FLEXIBLE M5+M15 FILTER", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
+  return { ok:true, version:"8.20 M5 ONLY CLOSED-CANDLE", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
 }
 
 async function getScan(force = false) {
   if (dailyLimitResetAt > Date.now()) {
     if (scanCache) return scanCache;
     const error = `Twelve Data daily credits exhausted. Retry after ${new Date(dailyLimitResetAt).toISOString()}.`;
-    return { ok:true, version:"8.19 FLEXIBLE M5+M15 FILTER", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
+    return { ok:true, version:"8.20 M5 ONLY CLOSED-CANDLE", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
       XAUUSD:{symbol:"XAUUSD",name:"GOLD",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}},
       BTCUSD:{symbol:"BTCUSD",name:"BITCOIN",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}}
     }};
@@ -460,9 +453,9 @@ app.get("/health", (req,res) => {
   const dailyLimit = dailyLimitResetAt > Date.now();
   const fresh = lastSuccessfulScanAt > 0 && Date.now() - lastSuccessfulScanAt < SCAN_CACHE_MS * 2;
   const marketDataStatus = !TWELVE_DATA_API_KEY ? "NOT_CONFIGURED" : dailyLimit ? "DAILY_LIMIT" : fresh ? "CONNECTED" : scanCache ? "UNAVAILABLE" : "CHECKING";
-  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.19 FLEXIBLE M5+M15 FILTER", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
+  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.20 M5 ONLY CLOSED-CANDLE", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
 });
-app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.19 FLEXIBLE M5+M15 FILTER", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
+app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.20 M5 ONLY CLOSED-CANDLE", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
 app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan()); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
 app.get("/api/history", (req,res) => {
   res.json({ ok:true, updatedAt:new Date().toISOString(), trades:getTradeHistory() });
@@ -509,7 +502,7 @@ async function tradingViewWebhook(req,res) {
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
 app.listen(PORT,"0.0.0.0",async () => {
-  console.log(`BIT ADAMS 8.19 FLEXIBLE M5+M15 FILTER running on port ${PORT}`);
+  console.log(`BIT ADAMS 8.20 M5 ONLY CLOSED-CANDLE running on port ${PORT}`);
   await loadTradeHistory();
   for (const trade of tradeHistory.values()) {
     if (trade.status === "OPEN" || trade.status === "TP1" || trade.status === "TP2") liveTrades.set(trade.symbol, trade);
