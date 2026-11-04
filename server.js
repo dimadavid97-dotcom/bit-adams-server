@@ -356,10 +356,17 @@ async function analyseAsset(symbol) {
   const m5Candles = await candles(symbol);
   if (m5Candles.length < 30) throw new Error("Not enough completed M5 candles");
   const m5 = analyse(m5Candles);
+  const m15Candles = aggregateTo15m(m5Candles);
+  if (m15Candles.length < 22) throw new Error("Not enough completed M15 candles for confirmation");
+  const m15 = analyse(m15Candles);
   const latest = m5Candles.at(-1);
-  // M5 ONLY: M15 is deliberately not used to block, delay, or approve entries.
+  // Entries are triggered on M5 only when the completed M15 trend agrees.
   let signal = m5.signal;
   let setupReason = "";
+  if (signal !== "WAIT" && (m15.signal !== signal || m15.confidence < 55)) {
+    signal = "WAIT";
+    setupReason = `M15 confirmation does not agree with M5 (M15: ${m15.signal}, score ${m15.confidence})`;
+  }
   const candleRange = Math.max(0, Number(latest.high) - Number(latest.low));
   const candleBody = Math.abs(Number(latest.close) - Number(latest.open));
   const bodyRatio = candleRange > 0 ? candleBody / candleRange : 0;
@@ -399,7 +406,8 @@ async function analyseAsset(symbol) {
     symbol, name:symbolLabel(symbol), price:m5.price, signal,
     confidence:signal === "WAIT" ? 0 : m5.confidence,
     setupType, setupReason, status:signal === "WAIT" ? "WAIT" : "CONFIRMED",
-    confirmed:signal !== "WAIT", m5, timeframes:{ M5:m5 }
+    confirmed:signal !== "WAIT", m5, m15, timeframes:{ M5:m5, M15:m15 },
+    chartCandles:m5Candles.slice(-60)
   };
   result.levels = signal === "WAIT" ? {} : levels(symbol,signal,m5.price,m5.atr);
   result.trade = await updateTrade(symbol,result);
