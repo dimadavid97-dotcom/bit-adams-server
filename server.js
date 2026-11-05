@@ -372,17 +372,29 @@ async function analyseAsset(symbol) {
   const bodyRatio = candleRange > 0 ? candleBody / candleRange : 0;
   const buyCandle = Number(latest.close) > Number(latest.open);
   const sellCandle = Number(latest.close) < Number(latest.open);
-  const nearTrend = m5.atr > 0 && Math.abs(m5.price - m5.ema9) <= m5.atr * 1.0;
-  // Avoid weak/doji candles and entries when RSI is already stretched.
-  const cleanCandle = bodyRatio >= 0.35;
-  const buyMomentum = m5.rsi >= 50 && m5.rsi <= 75 && m5.momentum > 0;
-  const sellMomentum = m5.rsi <= 50 && m5.rsi >= 25 && m5.momentum < 0;
-  if (signal === "BUY" && (m5.confidence < MIN_SIGNAL_SCORE || !buyCandle || !cleanCandle || !buyMomentum || !nearTrend)) {
+  const previous = m5Candles.at(-2) || {};
+  // Do not chase an extended move: require price to be close to EMA9
+  // and the last completed candle to show a pullback/rejection.
+  const nearTrend = m5.atr > 0 && Math.abs(m5.price - m5.ema9) <= m5.atr * 0.55;
+  const cleanCandle = bodyRatio >= 0.40 && candleRange <= m5.atr * 1.40;
+  const buyMomentum = m5.rsi >= 50 && m5.rsi <= 68 && m5.momentum > 0;
+  const sellMomentum = m5.rsi <= 50 && m5.rsi >= 32 && m5.momentum < 0;
+  const buyPullback = Number.isFinite(previous.low) &&
+    previous.low <= m5.ema9 + m5.atr * 0.25 &&
+    Number(latest.close) > Number(latest.open) &&
+    Number(latest.close) > Number(previous.close) &&
+    Number(latest.close) >= m5.ema9;
+  const sellPullback = Number.isFinite(previous.high) &&
+    previous.high >= m5.ema9 - m5.atr * 0.25 &&
+    Number(latest.close) < Number(latest.open) &&
+    Number(latest.close) < Number(previous.close) &&
+    Number(latest.close) <= m5.ema9;
+  if (signal === "BUY" && (m5.confidence < MIN_SIGNAL_SCORE || !buyCandle || !cleanCandle || !buyMomentum || !nearTrend || !buyPullback)) {
     signal = "WAIT";
-    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !buyCandle ? "Wait for a completed bullish M5 candle" : !cleanCandle ? "M5 candle is weak/doji — wait for a stronger close" : !buyMomentum ? "BUY momentum/RSI is not ideal — wait" : "Price too extended from EMA9 — wait for pullback";
-  } else if (signal === "SELL" && (m5.confidence < MIN_SIGNAL_SCORE || !sellCandle || !cleanCandle || !sellMomentum || !nearTrend)) {
+    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !buyCandle ? "Wait for a completed bullish M5 candle" : !cleanCandle ? "M5 candle is weak or oversized — wait" : !buyMomentum ? "BUY momentum/RSI is stretched — wait" : !nearTrend ? "BUY is too far from EMA9 — do not chase" : "Waiting for M5 pullback and bullish rejection near EMA9";
+  } else if (signal === "SELL" && (m5.confidence < MIN_SIGNAL_SCORE || !sellCandle || !cleanCandle || !sellMomentum || !nearTrend || !sellPullback)) {
     signal = "WAIT";
-    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !sellCandle ? "Wait for a completed bearish M5 candle" : !cleanCandle ? "M5 candle is weak/doji — wait for a stronger close" : !sellMomentum ? "SELL momentum/RSI is not ideal — wait" : "Price too extended from EMA9 — wait for pullback";
+    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !sellCandle ? "Wait for a completed bearish M5 candle" : !cleanCandle ? "M5 candle is weak or oversized — wait" : !sellMomentum ? "SELL momentum/RSI is stretched — wait" : !nearTrend ? "SELL is too far from EMA9 — do not chase" : "Waiting for M5 pullback and bearish rejection near EMA9";
   } else if (signal === "WAIT") {
     setupReason = "Waiting for clear M5 trend and momentum";
   }
