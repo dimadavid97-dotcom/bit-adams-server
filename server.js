@@ -522,7 +522,7 @@ async function tradingViewWebhook(req,res) {
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
 app.listen(PORT,"0.0.0.0",async () => {
-  console.log(`BIT ADAMS 8.21 M5 QUOTA-SAFE CLOSED-CANDLE running on port ${PORT}`);
+  console.log(`BIT ADAMS 9.0 LOSS-CONTROL TEST M5 M15 running on port ${PORT}`);
   await loadTradeHistory();
   for (const trade of tradeHistory.values()) {
     if (trade.status === "OPEN" || trade.status === "TP1" || trade.status === "TP2") liveTrades.set(trade.symbol, trade);
