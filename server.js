@@ -525,7 +525,18 @@ app.listen(PORT,"0.0.0.0",async () => {
   console.log(`BIT ADAMS 9.0 LOSS-CONTROL TEST M5 M15 running on port ${PORT}`);
   await loadTradeHistory();
   for (const trade of tradeHistory.values()) {
-    if (trade.status === "OPEN" || trade.status === "TP1" || trade.status === "TP2") liveTrades.set(trade.symbol, trade);
+    const createdAt = Date.parse(trade.createdAt || "");
+    if (Number.isFinite(createdAt)) {
+      lastSignalAt.set(trade.symbol, Math.max(lastSignalAt.get(trade.symbol) || 0, createdAt));
+    }
+    if (trade.status === "LOST") {
+      const closedAt = Date.parse(trade.closedAt || trade.updatedAt || trade.createdAt || "");
+      if (Number.isFinite(closedAt)) lastLossAt.set(trade.symbol, Math.max(lastLossAt.get(trade.symbol) || 0, closedAt));
+    }
+    if (trade.status === "OPEN" || trade.status === "TP1" || trade.status === "TP2") {
+      const current = liveTrades.get(trade.symbol);
+      if (!current || Date.parse(trade.createdAt) > Date.parse(current.createdAt)) liveTrades.set(trade.symbol, trade);
+    }
   }
   getScan(true).catch(error => console.error("Initial scan error:", error.message));
   setInterval(() => {
