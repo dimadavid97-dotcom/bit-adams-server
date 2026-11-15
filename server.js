@@ -19,7 +19,9 @@ const SCAN_CACHE_MS = 5 * 60_000; // Cache market data for five minutes to prote
 const SIGNAL_COOLDOWN_MS = 10 * 60_000;
 const LOSS_COOLDOWN_MS = 45 * 60_000;
 const MIN_SIGNAL_SCORE = 70;
-const BACKGROUND_SCAN_MS = 5 * 60_000; // Two symbols × 288 scans/day = about 576 credits/day.
+const BACKGROUND_SCAN_MS = 5 * 60_000; // Keep M5 cadence during active session.
+const BIT_DAILY_REQUEST_LIMIT = 500; // Together with ADAMS OPTION 150: at most 650 scheduled requests/day.
+const USAGE_FILE = process.env.TWELVE_DATA_USAGE_FILE || "/data/bit-adams-api-usage.json";
 const HISTORY_FILE = process.env.TRADE_HISTORY_FILE || "/data/bit-adams-trade-history.json";
 let historyWritePromise = Promise.resolve();
 
@@ -33,6 +35,50 @@ let scanPromise = null;
 let dailyLimitResetAt = 0;
 let lastProviderError = "";
 let lastSuccessfulScanAt = 0;
+let usageDay = "";
+let usageRequests = 0;
+let usageWritePromise = Promise.resolve();
+function todayUtc(){return new Date().toISOString().slice(0,10)}
+async function loadUsage() {
+  usageDay=todayUtc();usageRequests=0;
+  try {
+    const loaded=JSON.parse(await fs.readFile(USAGE_FILE,"utf8"));
+    if(loaded.date===usageDay && Number.isFinite(Number(loaded.requests))) usageRequests=Math.max(0,Number(loaded.requests));
+  }catch(error){if(error.code!=="ENOENT") console.warn("API budget load:",error.message)}
+}
+function persistUsage(){
+  const snapshot=JSON.stringify({date:usageDay,requests:usageRequests});
+  usageWritePromise=usageWritePromise.catch(()=>{}).then(async()=>{
+    try {
+      await fs.mkdir(path.dirname(USAGE_FILE),{recursive:true});
+      const file=USAGE_FILE+".tmp";
+      await fs.writeFile(file,snapshot,"utf8");
+      await fs.rename(file,USAGE_FILE);
+    }catch(error){console.error("API budget persistence error:",error.message)}
+  });
+}
+function reserveRequest(){
+  if(usageDay!==todayUtc()){usageDay=todayUtc();usageRequests=0}
+  if(usageRequests>=BIT_DAILY_REQUEST_LIMIT){
+    dailyLimitResetAt=nextUtcMidnight();
+    throw new Error("BIT ADAMS daily request budget reached. Paused to protect shared Twelve Data allowance.");
+  }
+  usageRequests++;
+  persistUsage();
+}
+function activeUkSession(){return isSignalWindowOpen()}
+function waitingMarketSnapshot(){
+  const assets={};
+  for(const symbol of ["XAUUSD","BTCUSD"]){
+    const previous=scanCache?.assets?.[symbol]||{};
+    const open=liveTrades.get(symbol)||null;
+    assets[symbol]={...previous,symbol,name:symbolLabel(symbol),signal:"WAIT",confirmed:false,status:"WAIT",confidence:0,levels:{},
+      setupReason:"Paused outside 08:00–20:00 UK to save API credits",trade:open};
+  }
+  return {ok:true,version:"8.22 M5 DUAL-AGENT ALERTS",updatedAt:new Date().toISOString(),cacheSeconds:SCAN_CACHE_MS/1000,
+    marketSession:"PAUSED",assets};
+}
+
 const liveTrades = new Map();
 const tradeHistory = new Map();
 const lastSignalAt = new Map();
@@ -195,6 +241,7 @@ function nextUtcMidnight() {
 
 async function candles(symbol) {
   if (!TWELVE_DATA_API_KEY) throw new Error("TWELVE_DATA_API_KEY missing in Render");
+  reserveRequest();
   const pair = symbol === "XAUUSD" ? "XAU/USD" : "BTC/USD";
   const url = new URL("https://api.twelvedata.com/time_series");
   url.search = new URLSearchParams({ symbol:pair, interval:"5min", outputsize:"80", order:"ASC", timezone:"UTC", apikey:TWELVE_DATA_API_KEY });
@@ -475,6 +522,9 @@ async function performScan() {
 }
 
 async function getScan(force = false) {
+  // Never spend credits just because the dashboard is opened outside signal hours.
+  // Preserve live-trade monitoring until any existing position is settled.
+  if(!activeUkSession() && liveTrades.size===0) return waitingMarketSnapshot();
   if (dailyLimitResetAt > Date.now()) {
     if (scanCache) return scanCache;
     const error = `Twelve Data daily credits exhausted. Retry after ${new Date(dailyLimitResetAt).toISOString()}.`;
@@ -500,7 +550,7 @@ app.get("/health", (req,res) => {
   const dailyLimit = dailyLimitResetAt > Date.now();
   const fresh = lastSuccessfulScanAt > 0 && Date.now() - lastSuccessfulScanAt < SCAN_CACHE_MS * 2;
   const marketDataStatus = !TWELVE_DATA_API_KEY ? "NOT_CONFIGURED" : dailyLimit ? "DAILY_LIMIT" : fresh ? "CONNECTED" : scanCache ? "UNAVAILABLE" : "CHECKING";
-  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.22 M5 DUAL-AGENT ALERTS", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
+  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.22 M5 DUAL-AGENT ALERTS", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, activeSession:activeUkSession(), requestBudget:BIT_DAILY_REQUEST_LIMIT, requestsToday:usageRequests, sharedBudgetNote:"Shared Twelve Data account may have other consumers; request counts are approximate credits", oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
 });
 app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.22 M5 DUAL-AGENT ALERTS", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
 app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan()); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
@@ -551,6 +601,7 @@ app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
 app.listen(PORT,"0.0.0.0",async () => {
   console.log(`BIT ADAMS 8.22 M5 DUAL-AGENT ALERTS running on port ${PORT}`);
   await loadTradeHistory();
+  await loadUsage();
   for (const trade of tradeHistory.values()) {
     if (trade.status === "OPEN" || trade.status === "TP1" || trade.status === "TP2") liveTrades.set(trade.symbol, trade);
   }
