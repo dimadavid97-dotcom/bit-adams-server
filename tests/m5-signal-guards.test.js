@@ -6,7 +6,7 @@ function series(direction=1,n=80,flat=false) {
   const arr=[];
   let price=100;
   for (let i=0;i<n;i++) {
-    const move=flat?0.001: direction*(1.1 + (i%7===0?-0.14:0.06));
+    const move=flat?0: direction*(1.1 + (i%7===0?-0.14:0.06));
     const open=price, close=open+move;
     const high=Math.max(open,close)+(flat?0.02:0.19);
     const low=Math.min(open,close)-(flat?0.02:0.19);
