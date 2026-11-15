@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { reviewSignal } from "./signal-guards.js";
 
 dotenv.config();
 
@@ -17,7 +18,7 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const SCAN_CACHE_MS = 5 * 60_000; // Cache market data for five minutes to protect the 800-credit daily plan.
 const SIGNAL_COOLDOWN_MS = 10 * 60_000;
 const LOSS_COOLDOWN_MS = 45 * 60_000;
-const MIN_SIGNAL_SCORE = 60;
+const MIN_SIGNAL_SCORE = 70;
 const BACKGROUND_SCAN_MS = 5 * 60_000; // Two symbols × 288 scans/day = about 576 credits/day.
 const HISTORY_FILE = process.env.TRADE_HISTORY_FILE || "/data/bit-adams-trade-history.json";
 let historyWritePromise = Promise.resolve();
@@ -93,6 +94,13 @@ function eventMessage(event, symbol, payload = {}) {
   const lines = [`${symbolLabel(symbol)}${tf ? ` • ${tf}` : ""}`];
   const setupType = clean(payload.setupType);
   if (setupType) lines.push(`SETUP: ${setupType}`);
+  if (Number.isFinite(Number(payload.qualityScore))) {
+    lines.push(`SETUP QUALITY: ${Number(payload.qualityScore)}/99 (NOT win probability)`);
+  }
+  if (payload.agentReview?.approved === true && ["BUY","SELL"].includes(event)) {
+    lines.push("✅ STRONG M5: TREND AGENT + ENTRY AGENT APPROVED");
+    lines.push("⏰ Check the chart before entering. Demo first.");
+  }
   const labels = { BUY:"🟢 SIGNAL: BUY", SELL:"🔴 SIGNAL: SELL", TP1:"✅ TAKE PROFIT 1 HIT\nMOVE SL TO ENTRY", TP2:"✅ TAKE PROFIT 2 HIT", TP3:"🏆 TAKE PROFIT 3 HIT\nTRADE WIN", WIN:"🏆 TRADE WIN", SL:"⛔ STOP LOSS HIT", BREAK_EVEN:"🟡 BREAK-EVEN\nTRADE CLOSED AT ENTRY" };
   if (labels[event]) lines.push(labels[event]);
   for (const [label, value] of [["ENTRY",payload.entry ?? payload.entryPrice],["SL",payload.sl ?? payload.stopLoss],["TP1",payload.tp1],["TP2",payload.tp2],["TP3",payload.tp3],["PRICE",payload.price ?? payload.close]]) if (clean(value)) lines.push(`${label}: ${clean(value)}`);
@@ -289,7 +297,19 @@ function getTradeHistory() {
     .slice(0,250);
 }
 
+function londonDate(value) {
+  return new Intl.DateTimeFormat("sv-SE", {timeZone:"Europe/London",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date(value));
+}
+function dailyLossPause(symbol) {
+  const today=londonDate(Date.now());
+  const stopped=[...tradeHistory.values()].filter(trade => trade.status === "LOST" && trade.closedAt && londonDate(trade.closedAt) === today);
+  if (stopped.length >= 3) return "Daily safety pause: three stopped trades";
+  if (stopped.filter(trade=>trade.symbol === symbol).length >= 2) return "Daily safety pause: two stopped trades on this asset";
+  return "";
+}
 function signalPauseReason(symbol) {
+  const daily=dailyLossPause(symbol);
+  if (daily) return daily;
   const now = Date.now();
   const lossRemaining = LOSS_COOLDOWN_MS - (now - (lastLossAt.get(symbol) || 0));
   if (lossRemaining > 0) return `Paused after stop loss · ${Math.ceil(lossRemaining / 60_000)} min left`;
@@ -322,7 +342,7 @@ async function updateTrade(symbol, analysis) {
     const cooldown = Date.now() - (lastSignalAt.get(symbol) || 0);
     const lossCooldown = Date.now() - (lastLossAt.get(symbol) || 0);
     if (cooldown >= SIGNAL_COOLDOWN_MS && lossCooldown >= LOSS_COOLDOWN_MS) {
-      trade = { symbol, direction:analysis.signal, timeframe:"M5", setupType:analysis.setupType, confidence:analysis.confidence, status:"OPEN", createdAt:new Date().toISOString(), openedOnCandle:analysis.m5?.datetime || null, ...analysis.levels };
+      trade = { symbol, direction:analysis.signal, timeframe:"M5", setupType:analysis.setupType, confidence:analysis.confidence, qualityScore:analysis.qualityScore, agentReview:analysis.agentReview, status:"OPEN", createdAt:new Date().toISOString(), openedOnCandle:analysis.m5?.datetime || null, ...analysis.levels };
       liveTrades.set(symbol, trade); saveTradeSnapshot(trade); lastSignalAt.set(symbol, Date.now());
       await notifyEvent(trade.direction, symbol, trade);
       // Do not test the just-closed signal candle against levels calculated from its close.
@@ -398,6 +418,12 @@ async function analyseAsset(symbol) {
   } else if (signal === "WAIT") {
     setupReason = "Waiting for clear M5 trend and momentum";
   }
+  const candidateLevels = signal === "WAIT" ? {} : levels(symbol,signal,m5.price,m5.atr);
+  const agentReview = signal === "WAIT" ? null : reviewSignal(signal,m5,m15,m5Candles,candidateLevels);
+  if (agentReview && !agentReview.approved) {
+    signal = "WAIT";
+    setupReason = agentReview.reason;
+  }
   if (signal !== "WAIT" && !liveTrades.has(symbol)) {
     const pauseReason = signalPauseReason(symbol);
     if (pauseReason) {
@@ -413,15 +439,16 @@ async function analyseAsset(symbol) {
     signal = "WAIT";
     setupReason = "Trade already open — monitoring TP/SL; no duplicate entry";
   }
-  const setupType = signal === "WAIT" ? "WAIT" : "M5 CLOSED-CANDLE CONFIRMATION";
+  const setupType = signal === "WAIT" ? "WAIT" : "M5 DUAL-AGENT STRONG CONFIRMATION";
   const result = {
     symbol, name:symbolLabel(symbol), price:m5.price, signal,
-    confidence:signal === "WAIT" ? 0 : m5.confidence,
+    confidence:signal === "WAIT" ? 0 : agentReview.qualityScore,
+    qualityScore:agentReview?.qualityScore ?? null, agentReview,
     setupType, setupReason, status:signal === "WAIT" ? "WAIT" : "CONFIRMED",
     confirmed:signal !== "WAIT", m5, m15, timeframes:{ M5:m5, M15:m15 },
     chartCandles:m5Candles.slice(-60)
   };
-  result.levels = signal === "WAIT" ? {} : levels(symbol,signal,m5.price,m5.atr);
+  result.levels = signal === "WAIT" ? {} : candidateLevels;
   result.trade = await updateTrade(symbol,result);
   if (!liveTrades.has(symbol)) {
     const pauseReason = signalPauseReason(symbol);
@@ -444,14 +471,14 @@ async function performScan() {
     const symbol = i === 0 ? "XAUUSD" : "BTCUSD";
     assets[symbol] = settled[i].status === "fulfilled" ? settled[i].value : { symbol, name:symbolLabel(symbol), signal:"WAIT", confidence:0, status:"ERROR", error:settled[i].reason?.message || "Data unavailable", timeframes:{} };
   }
-  return { ok:true, version:"8.21 M5 QUOTA-SAFE CLOSED-CANDLE", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
+  return { ok:true, version:"8.22 M5 DUAL-AGENT ALERTS", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
 }
 
 async function getScan(force = false) {
   if (dailyLimitResetAt > Date.now()) {
     if (scanCache) return scanCache;
     const error = `Twelve Data daily credits exhausted. Retry after ${new Date(dailyLimitResetAt).toISOString()}.`;
-    return { ok:true, version:"8.21 M5 QUOTA-SAFE CLOSED-CANDLE", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
+    return { ok:true, version:"8.22 M5 DUAL-AGENT ALERTS", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
       XAUUSD:{symbol:"XAUUSD",name:"GOLD",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}},
       BTCUSD:{symbol:"BTCUSD",name:"BITCOIN",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}}
     }};
@@ -473,9 +500,9 @@ app.get("/health", (req,res) => {
   const dailyLimit = dailyLimitResetAt > Date.now();
   const fresh = lastSuccessfulScanAt > 0 && Date.now() - lastSuccessfulScanAt < SCAN_CACHE_MS * 2;
   const marketDataStatus = !TWELVE_DATA_API_KEY ? "NOT_CONFIGURED" : dailyLimit ? "DAILY_LIMIT" : fresh ? "CONNECTED" : scanCache ? "UNAVAILABLE" : "CHECKING";
-  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.21 M5 QUOTA-SAFE CLOSED-CANDLE", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
+  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.22 M5 DUAL-AGENT ALERTS", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
 });
-app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.21 M5 QUOTA-SAFE CLOSED-CANDLE", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
+app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.22 M5 DUAL-AGENT ALERTS", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
 app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan()); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
 app.get("/api/history", (req,res) => {
   res.json({ ok:true, updatedAt:new Date().toISOString(), trades:getTradeHistory() });
@@ -522,7 +549,7 @@ async function tradingViewWebhook(req,res) {
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
 app.listen(PORT,"0.0.0.0",async () => {
-  console.log(`BIT ADAMS 8.21 M5 QUOTA-SAFE CLOSED-CANDLE running on port ${PORT}`);
+  console.log(`BIT ADAMS 8.22 M5 DUAL-AGENT ALERTS running on port ${PORT}`);
   await loadTradeHistory();
   for (const trade of tradeHistory.values()) {
     if (trade.status === "OPEN" || trade.status === "TP1" || trade.status === "TP2") liveTrades.set(trade.symbol, trade);
