@@ -1,0 +1,40 @@
+name: Check BIT ADAMS 8.22 Render deployment
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deployment-health.yml'
+      - 'server.js'
+      - 'signal-guards.js'
+  workflow_dispatch:
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify Render is serving current server build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,time,urllib.request
+          url='https://bit-adams-server.onrender.com/health'
+          expected='8.22 M5 DUAL-AGENT ALERTS'
+          last=None
+          for attempt in range(12):
+              try:
+                  with urllib.request.urlopen(url,timeout=17) as response:
+                      data=json.load(response)
+                  version=data.get('version')
+                  print('Health:',json.dumps({'status':data.get('status'),'version':version,'market':data.get('marketDataStatus'),'telegramConfigured':data.get('telegramConfigured')},ensure_ascii=False),flush=True)
+                  if data.get('status')=='UP' and version==expected:
+                      print('Server deployment verified, version 8.22 is live')
+                      break
+                  last='Version not current: '+str(version)
+              except Exception as error:
+                  last=str(error)
+                  print('Attempt',attempt+1,'failed:',last,flush=True)
+              time.sleep(10)
+          else:
+              raise SystemExit('Render did not confirm deployed version: '+str(last))
+          PY
