@@ -4,7 +4,6 @@ import dotenv from "dotenv";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { reviewSignal } from "./signal-guards.js";
-import { sendStrongSignalAlert, ringAlertConfiguration } from "./ring-alerts.js";
 
 dotenv.config();
 
@@ -95,6 +94,13 @@ function eventMessage(event, symbol, payload = {}) {
   const lines = [`${symbolLabel(symbol)}${tf ? ` • ${tf}` : ""}`];
   const setupType = clean(payload.setupType);
   if (setupType) lines.push(`SETUP: ${setupType}`);
+  if (Number.isFinite(Number(payload.qualityScore))) {
+    lines.push(`SETUP QUALITY: ${Number(payload.qualityScore)}/99 (NOT win probability)`);
+  }
+  if (payload.agentReview?.approved === true && ["BUY","SELL"].includes(event)) {
+    lines.push("✅ STRONG M5: TREND AGENT + ENTRY AGENT APPROVED");
+    lines.push("⏰ Check the chart before entering. Demo first.");
+  }
   const labels = { BUY:"🟢 SIGNAL: BUY", SELL:"🔴 SIGNAL: SELL", TP1:"✅ TAKE PROFIT 1 HIT\nMOVE SL TO ENTRY", TP2:"✅ TAKE PROFIT 2 HIT", TP3:"🏆 TAKE PROFIT 3 HIT\nTRADE WIN", WIN:"🏆 TRADE WIN", SL:"⛔ STOP LOSS HIT", BREAK_EVEN:"🟡 BREAK-EVEN\nTRADE CLOSED AT ENTRY" };
   if (labels[event]) lines.push(labels[event]);
   for (const [label, value] of [["ENTRY",payload.entry ?? payload.entryPrice],["SL",payload.sl ?? payload.stopLoss],["TP1",payload.tp1],["TP2",payload.tp2],["TP3",payload.tp3],["PRICE",payload.price ?? payload.close]]) if (clean(value)) lines.push(`${label}: ${clean(value)}`);
@@ -339,7 +345,6 @@ async function updateTrade(symbol, analysis) {
       trade = { symbol, direction:analysis.signal, timeframe:"M5", setupType:analysis.setupType, confidence:analysis.confidence, qualityScore:analysis.qualityScore, agentReview:analysis.agentReview, status:"OPEN", createdAt:new Date().toISOString(), openedOnCandle:analysis.m5?.datetime || null, ...analysis.levels };
       liveTrades.set(symbol, trade); saveTradeSnapshot(trade); lastSignalAt.set(symbol, Date.now());
       await notifyEvent(trade.direction, symbol, trade);
-      sendStrongSignalAlert(trade.direction,symbol,trade).then(result => console.log("Strong signal ring",JSON.stringify(result))).catch(error => console.error("Strong signal ring failed",error.message));
       // Do not test the just-closed signal candle against levels calculated from its close.
       return trade;
     }
@@ -495,7 +500,7 @@ app.get("/health", (req,res) => {
   const dailyLimit = dailyLimitResetAt > Date.now();
   const fresh = lastSuccessfulScanAt > 0 && Date.now() - lastSuccessfulScanAt < SCAN_CACHE_MS * 2;
   const marketDataStatus = !TWELVE_DATA_API_KEY ? "NOT_CONFIGURED" : dailyLimit ? "DAILY_LIMIT" : fresh ? "CONNECTED" : scanCache ? "UNAVAILABLE" : "CHECKING";
-  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.22 M5 DUAL-AGENT ALERTS", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), ...ringAlertConfiguration(), time:new Date().toISOString() });
+  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.22 M5 DUAL-AGENT ALERTS", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
 });
 app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.22 M5 DUAL-AGENT ALERTS", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
 app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan()); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
