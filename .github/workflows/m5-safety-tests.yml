@@ -1,0 +1,25 @@
+name: BIT ADAMS M5 safety tests
+on:
+  pull_request:
+    paths:
+      - 'server.js'
+      - 'signal-guards.js'
+      - 'tests/**'
+      - '.github/workflows/m5-safety-tests.yml'
+  push:
+    branches:
+      - main
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Syntax and dependency checks
+        run: |
+          node --check server.js
+          node --check signal-guards.js
+      - name: Behavioral test scenarios
+        run: node --test tests/*.test.js
