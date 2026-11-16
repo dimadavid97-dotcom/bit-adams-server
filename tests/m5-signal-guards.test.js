@@ -83,3 +83,34 @@ test("missing data is rejected",()=>{
   const r=reviewSignal("BUY",null,null,[],{});
   assert.equal(r.approved,false);
 });
+
+test("strict remains default when no profile is specified",()=>{
+  const {candles,m5,m15,levels,side}=setup(1);
+  assert.deepEqual(reviewSignal(side,m5,m15,candles,levels),
+    reviewSignal(side,m5,m15,candles,levels,"STRICT"));
+});
+
+test("balanced never overrides M15 directional conflict",()=>{
+  const {candles,m5,m15,levels,side}=setup(1);
+  m15.signal="SELL";
+  assert.equal(reviewSignal(side,m5,m15,candles,levels,"BALANCED").approved,false);
+});
+
+test("balanced rejects thin candle and missing data",()=>{
+  const {candles,m5,m15,levels,side}=setup(1);
+  const last=candles.at(-1);
+  last.open=last.close-0.01;
+  last.high=last.close+1;
+  last.low=last.open-1;
+  assert.equal(reviewSignal(side,m5,m15,candles,levels,"BALANCED").approved,false);
+  assert.equal(reviewSignal("BUY",null,null,[],{},"BALANCED").approved,false);
+});
+
+test("balanced still requires reward risk and directional trend",()=>{
+  const {candles,m5,m15,levels,side}=setup(1);
+  levels.tp2=levels.entry+.5;
+  assert.equal(reviewSignal(side,m5,m15,candles,levels,"BALANCED").approved,false);
+  levels.tp2=levels.entry+5.5;
+  m15.momentum=-0.3;
+  assert.equal(reviewSignal(side,m5,m15,candles,levels,"BALANCED").approved,false);
+});
