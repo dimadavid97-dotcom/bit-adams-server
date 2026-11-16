@@ -19,6 +19,9 @@ const SCAN_CACHE_MS = 5 * 60_000; // Cache market data for five minutes to prote
 const SIGNAL_COOLDOWN_MS = 10 * 60_000;
 const LOSS_COOLDOWN_MS = 45 * 60_000;
 const MIN_SIGNAL_SCORE = 70;
+// M5 BALANCED is the default. Set SIGNAL_MODE=STRICT in Render to restore strict entries.
+const SIGNAL_MODE = process.env.SIGNAL_MODE === "STRICT" ? "STRICT" : "BALANCED";
+const BALANCED_MODE = SIGNAL_MODE === "BALANCED";
 const BACKGROUND_SCAN_MS = 5 * 60_000; // Keep M5 cadence during active session.
 const BIT_DAILY_REQUEST_LIMIT = 500; // Together with ADAMS OPTION 150: at most 650 scheduled requests/day.
 const USAGE_FILE = process.env.TWELVE_DATA_USAGE_FILE || "/data/bit-adams-api-usage.json";
@@ -75,7 +78,7 @@ function waitingMarketSnapshot(){
     assets[symbol]={...previous,symbol,name:symbolLabel(symbol),signal:"WAIT",confirmed:false,status:"WAIT",confidence:0,levels:{},
       setupReason:"Paused outside 08:00–20:00 UK to save API credits",trade:open};
   }
-  return {ok:true,version:"8.22 M5 DUAL-AGENT ALERTS",updatedAt:new Date().toISOString(),cacheSeconds:SCAN_CACHE_MS/1000,
+  return {ok:true,version:"8.23 M5 BALANCED DUAL-AGENTS",updatedAt:new Date().toISOString(),cacheSeconds:SCAN_CACHE_MS/1000,
     marketSession:"PAUSED",assets};
 }
 
@@ -442,17 +445,17 @@ async function analyseAsset(symbol) {
   const previous = m5Candles.at(-2) || {};
   // Do not chase an extended move: require price to be close to EMA9
   // and the last completed candle to show a pullback/rejection.
-  const nearTrend = m5.atr > 0 && Math.abs(m5.price - m5.ema9) <= m5.atr * 0.55;
-  const cleanCandle = bodyRatio >= 0.40 && candleRange <= m5.atr * 1.40;
-  const buyMomentum = m5.rsi >= 50 && m5.rsi <= 68 && m5.momentum > 0;
-  const sellMomentum = m5.rsi <= 50 && m5.rsi >= 32 && m5.momentum < 0;
+  const nearTrend = m5.atr > 0 && Math.abs(m5.price - m5.ema9) <= m5.atr * (BALANCED_MODE ? 0.70 : 0.55);
+  const cleanCandle = bodyRatio >= (BALANCED_MODE ? 0.36 : 0.40) && candleRange <= m5.atr * (BALANCED_MODE ? 1.55 : 1.40);
+  const buyMomentum = m5.rsi >= 50 && m5.rsi <= (BALANCED_MODE ? 70 : 68) && m5.momentum > 0;
+  const sellMomentum = m5.rsi <= 50 && m5.rsi >= (BALANCED_MODE ? 30 : 32) && m5.momentum < 0;
   const buyPullback = Number.isFinite(previous.low) &&
-    previous.low <= m5.ema9 + m5.atr * 0.25 &&
+    previous.low <= m5.ema9 + m5.atr * (BALANCED_MODE ? 0.35 : 0.25) &&
     Number(latest.close) > Number(latest.open) &&
     Number(latest.close) > Number(previous.close) &&
     Number(latest.close) >= m5.ema9;
   const sellPullback = Number.isFinite(previous.high) &&
-    previous.high >= m5.ema9 - m5.atr * 0.25 &&
+    previous.high >= m5.ema9 - m5.atr * (BALANCED_MODE ? 0.35 : 0.25) &&
     Number(latest.close) < Number(latest.open) &&
     Number(latest.close) < Number(previous.close) &&
     Number(latest.close) <= m5.ema9;
@@ -466,7 +469,7 @@ async function analyseAsset(symbol) {
     setupReason = "Waiting for clear M5 trend and momentum";
   }
   const candidateLevels = signal === "WAIT" ? {} : levels(symbol,signal,m5.price,m5.atr);
-  const agentReview = signal === "WAIT" ? null : reviewSignal(signal,m5,m15,m5Candles,candidateLevels);
+  const agentReview = signal === "WAIT" ? null : reviewSignal(signal,m5,m15,m5Candles,candidateLevels,SIGNAL_MODE);
   if (agentReview && !agentReview.approved) {
     signal = "WAIT";
     setupReason = agentReview.reason;
@@ -486,7 +489,7 @@ async function analyseAsset(symbol) {
     signal = "WAIT";
     setupReason = "Trade already open — monitoring TP/SL; no duplicate entry";
   }
-  const setupType = signal === "WAIT" ? "WAIT" : "M5 DUAL-AGENT STRONG CONFIRMATION";
+  const setupType = signal === "WAIT" ? "WAIT" : `M5 ${SIGNAL_MODE} DUAL-AGENT CONFIRMATION`;
   const result = {
     symbol, name:symbolLabel(symbol), price:m5.price, signal,
     confidence:signal === "WAIT" ? 0 : agentReview.qualityScore,
@@ -518,7 +521,7 @@ async function performScan() {
     const symbol = i === 0 ? "XAUUSD" : "BTCUSD";
     assets[symbol] = settled[i].status === "fulfilled" ? settled[i].value : { symbol, name:symbolLabel(symbol), signal:"WAIT", confidence:0, status:"ERROR", error:settled[i].reason?.message || "Data unavailable", timeframes:{} };
   }
-  return { ok:true, version:"8.22 M5 DUAL-AGENT ALERTS", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
+  return { ok:true, version:"8.23 M5 BALANCED DUAL-AGENTS", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
 }
 
 async function getScan(force = false) {
@@ -528,7 +531,7 @@ async function getScan(force = false) {
   if (dailyLimitResetAt > Date.now()) {
     if (scanCache) return scanCache;
     const error = `Twelve Data daily credits exhausted. Retry after ${new Date(dailyLimitResetAt).toISOString()}.`;
-    return { ok:true, version:"8.22 M5 DUAL-AGENT ALERTS", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
+    return { ok:true, version:"8.23 M5 BALANCED DUAL-AGENTS", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
       XAUUSD:{symbol:"XAUUSD",name:"GOLD",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}},
       BTCUSD:{symbol:"BTCUSD",name:"BITCOIN",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}}
     }};
@@ -550,9 +553,9 @@ app.get("/health", (req,res) => {
   const dailyLimit = dailyLimitResetAt > Date.now();
   const fresh = lastSuccessfulScanAt > 0 && Date.now() - lastSuccessfulScanAt < SCAN_CACHE_MS * 2;
   const marketDataStatus = !TWELVE_DATA_API_KEY ? "NOT_CONFIGURED" : dailyLimit ? "DAILY_LIMIT" : fresh ? "CONNECTED" : scanCache ? "UNAVAILABLE" : "CHECKING";
-  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.22 M5 DUAL-AGENT ALERTS", status:"UP", twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, activeSession:activeUkSession(), requestBudget:BIT_DAILY_REQUEST_LIMIT, requestsToday:usageRequests, sharedBudgetNote:"Shared Twelve Data account may have other consumers; request counts are approximate credits", oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
+  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.23 M5 BALANCED DUAL-AGENTS", status:"UP", signalMode:SIGNAL_MODE, twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, activeSession:activeUkSession(), requestBudget:BIT_DAILY_REQUEST_LIMIT, requestsToday:usageRequests, sharedBudgetNote:"Shared Twelve Data account may have other consumers; request counts are approximate credits", oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
 });
-app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.22 M5 DUAL-AGENT ALERTS", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
+app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.23 M5 BALANCED DUAL-AGENTS", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
 app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan()); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
 app.get("/api/history", (req,res) => {
   res.json({ ok:true, updatedAt:new Date().toISOString(), trades:getTradeHistory() });
@@ -599,7 +602,7 @@ async function tradingViewWebhook(req,res) {
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
 app.listen(PORT,"0.0.0.0",async () => {
-  console.log(`BIT ADAMS 8.22 M5 DUAL-AGENT ALERTS running on port ${PORT}`);
+  console.log(`BIT ADAMS 8.23 M5 BALANCED DUAL-AGENTS running on port ${PORT}`);
   await loadTradeHistory();
   await loadUsage();
   for (const trade of tradeHistory.values()) {
