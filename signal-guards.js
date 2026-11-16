@@ -38,7 +38,8 @@ export function calculateAdx(candles, period = 14) {
   return {adx:round(adx),plusDI:round(current.plusDI),minusDI:round(current.minusDI)};
 }
 
-export function trendAgent(direction,m5,m15,candles) {
+export function trendAgent(direction,m5,m15,candles,profile="STRICT") {
+  const balanced=profile==="BALANCED";
   const d = direction === "BUY" ? 1 : direction === "SELL" ? -1 : 0;
   if (!d || !m5 || !m15 || !Array.isArray(candles)) return {approved:false,reason:"Missing market data"};
   const indicators = calculateAdx(candles);
@@ -49,15 +50,16 @@ export function trendAgent(direction,m5,m15,candles) {
     [d * (m5.ema9-m5.ema21) > 0,"M5 EMA trend disagrees"],
     [d * (m15.ema9-m15.ema21) > 0,"M15 EMA trend disagrees"],
     [d * m15.momentum > 0,"M15 momentum disagrees"],
-    [indicators.adx >= 20,"Weak/ranging market (ADX below 20)"],
+    [indicators.adx >= (balanced?18:20),"Weak/ranging market (ADX too low)"],
     [d * (indicators.plusDI-indicators.minusDI) > 0,"ADX directional movement disagrees"],
-    [emaGap >= 0.13,"EMAs too compressed for reliable direction"]
+    [emaGap >= (balanced?0.10:0.13),"EMAs too compressed for reliable direction"]
   ];
   const failed = conditions.find(([ok])=>!ok);
   return {approved:!failed,reason:failed ? failed[1] : "M5/M15 trend and ADX agree",adx:indicators.adx,plusDI:indicators.plusDI,minusDI:indicators.minusDI,emaGap:round(emaGap)};
 }
 
-export function entryAgent(direction,m5,candles,levels) {
+export function entryAgent(direction,m5,candles,levels,profile="STRICT") {
+  const balanced=profile==="BALANCED";
   if (!["BUY","SELL"].includes(direction) || !m5 || !Array.isArray(candles) || candles.length < 10) return {approved:false,reason:"Missing recent M5 candles"};
   const last = candles.at(-1);
   const sign = direction === "BUY" ? 1 : -1;
@@ -74,10 +76,10 @@ export function entryAgent(direction,m5,candles,levels) {
   const conditions = [
     [range > 0 && m5.atr > 0,"No valid M5 volatility"],
     [sign * (last.close-last.open) > 0,"Last M5 candle contradicts direction"],
-    [bodyRatio >= 0.45,"M5 confirmation candle has a small body"],
-    [direction === "BUY" ? closeLocation >= 0.68 : closeLocation <= 0.32,"M5 candle closed without directional conviction"],
+    [bodyRatio >= (balanced?0.40:0.45),"M5 confirmation candle has a small body"],
+    [direction === "BUY" ? closeLocation >= (balanced?0.63:0.68) : closeLocation <= (balanced?0.37:0.32),"M5 candle closed without directional conviction"],
     [range <= m5.atr * 1.6,"M5 candle is unusually large"],
-    [efficiency >= 0.28,"Recent M5 price action is choppy"],
+    [efficiency >= (balanced?0.25:0.28),"Recent M5 price action is choppy"],
     [sign * (closes.at(-1)-closes[0]) > 0,"Recent M5 price action disagrees"],
     [rr2 >= 1.3,"Reward/risk to TP2 is too small"]
   ];
@@ -85,9 +87,9 @@ export function entryAgent(direction,m5,candles,levels) {
   return {approved:!failed,reason:failed ? failed[1] : "M5 candle, structure and reward/risk agree",efficiency:round(efficiency),bodyRatio:round(bodyRatio),rr2:round(rr2)};
 }
 
-export function reviewSignal(direction,m5,m15,candles,levels) {
-  const trend=trendAgent(direction,m5,m15,candles);
-  const entry=entryAgent(direction,m5,candles,levels);
+export function reviewSignal(direction,m5,m15,candles,levels,profile="STRICT") {
+  const trend=trendAgent(direction,m5,m15,candles,profile);
+  const entry=entryAgent(direction,m5,candles,levels,profile);
   const qualityScore=Math.min(99,Math.round(0.4*(m5?.confidence || 0)+0.35*(m15?.confidence || 0)+0.25*Math.min(100,50+trend.adx)));
   return {approved:trend.approved && entry.approved,qualityScore,trend,entry,
     reason:!trend.approved ? "Trend Agent: "+trend.reason : !entry.approved ? "Entry Agent: "+entry.reason : "STRONG M5 BUY/SELL: both agents approved"};
