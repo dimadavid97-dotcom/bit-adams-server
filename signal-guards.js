@@ -87,10 +87,95 @@ export function entryAgent(direction,m5,candles,levels,profile="STRICT") {
   return {approved:!failed,reason:failed ? failed[1] : "M5 candle, structure and reward/risk agree",efficiency:round(efficiency),bodyRatio:round(bodyRatio),rr2:round(rr2)};
 }
 
+// An independent price-action/momentum reviewer. Uses the same already-fetched
+// closed M5 candles; adding agents does not increase Twelve Data API usage.
+export function momentumAgent(direction,m5,candles) {
+  if (!["BUY","SELL"].includes(direction) || !m5 ||
+      !Array.isArray(candles) || candles.length < 10) {
+    return {approved:false,reason:"Missing momentum data"};
+  }
+  const sign=direction==="BUY"?1:-1;
+  const last=candles.at(-1);
+  const previous=candles.at(-2);
+  const fourth=candles.at(-4);
+  if (![last.open,last.close,previous.high,previous.low,fourth.close,
+        m5.ema9,m5.ema21,m5.rsi,m5.momentum].every(finite)) {
+    return {approved:false,reason:"Invalid M5 momentum values"};
+  }
+  const directionalCandle=sign*(last.close-last.open)>0;
+  const emaAligned=sign*(m5.ema9-m5.ema21)>0;
+  const recentAdvance=sign*(last.close-fourth.close)>0;
+  const rsiAligned=direction==="BUY" ? m5.rsi>=50 && m5.rsi<=70 :
+    m5.rsi<=50 && m5.rsi>=30;
+  const breakout=direction==="BUY" ? last.close>previous.high :
+    last.close<previous.low;
+  const impulse=sign*m5.momentum>0;
+  const approved=directionalCandle && emaAligned && recentAdvance &&
+    rsiAligned && impulse && breakout;
+  return {approved,reason:approved?"Momentum and M5 breakout agree":
+    "No confirmed directional M5 momentum breakout",breakout,rsiAligned};
+}
+
+// Hard veto for both profiles: adding votes cannot override unsafe levels,
+// a weak/oversized M5 candle or an already overextended entry.
+export function riskAgent(direction,m5,candles,levels,profile="STRICT") {
+  const balanced=profile==="BALANCED";
+  if (!["BUY","SELL"].includes(direction) || !m5 ||
+      !Array.isArray(candles) || !candles.length || !levels) {
+    return {approved:false,reason:"Missing risk data"};
+  }
+  const last=candles.at(-1);
+  const nums=[last.open,last.high,last.low,last.close,m5.atr,m5.price,
+    m5.ema9,levels.entry,levels.sl,levels.tp1,levels.tp2,levels.tp3];
+  if (!nums.every(v=>v!==null && v!==undefined && Number.isFinite(Number(v)))) {
+    return {approved:false,reason:"Invalid trade or price levels"};
+  }
+  const sign=direction==="BUY"?1:-1;
+  const range=last.high-last.low;
+  const body=sign*(last.close-last.open);
+  const bodyRatio=range>0?body/range:0;
+  const closeLocation=range>0?(last.close-last.low)/range:0.5;
+  const risk=sign*(levels.entry-levels.sl);
+  const reward2=sign*(levels.tp2-levels.entry);
+  const rr2=risk>0?reward2/risk:0;
+  const conditions=[
+    [m5.atr>0 && range>0 && bodyRatio>=(balanced?0.32:0.40),
+      "Insufficient directional M5 candle body"],
+    [direction==="BUY"?closeLocation>=0.53:closeLocation<=0.47,
+      "M5 candle close lacks direction"],
+    [range<=m5.atr*1.6,"M5 candle exceeds volatility safety limit"],
+    [Math.abs(m5.price-m5.ema9)<=m5.atr*(balanced?1.30:1.00),
+      "Entry too far from EMA9"],
+    [risk>0 && rr2>=1.3,"Invalid stop loss or risk/reward below 1.3"],
+    [sign*(levels.tp1-levels.entry)>0 &&
+      sign*(levels.tp3-levels.tp2)>0,
+      "Target levels disagree with trade direction"]
+  ];
+  const failure=conditions.find(([ok])=>!ok);
+  return {approved:!failure,reason:failure?failure[1]:"M5 volatility, entry distance and levels acceptable",
+    rr2:round(rr2),bodyRatio:round(bodyRatio)};
+}
+
+// Four independent reviewers. In BALANCED mode the Trend and Risk agents
+// have veto rights and either Entry or Momentum must confirm (at least 3/4).
+// STRICT mode retains full unanimity. This increases eligible setup types
+// without permitting contradictory M15 trends or risky/unconfirmed entries.
 export function reviewSignal(direction,m5,m15,candles,levels,profile="STRICT") {
   const trend=trendAgent(direction,m5,m15,candles,profile);
   const entry=entryAgent(direction,m5,candles,levels,profile);
-  const qualityScore=Math.min(99,Math.round(0.4*(m5?.confidence || 0)+0.35*(m15?.confidence || 0)+0.25*Math.min(100,50+trend.adx)));
-  return {approved:trend.approved && entry.approved,qualityScore,trend,entry,
-    reason:!trend.approved ? "Trend Agent: "+trend.reason : !entry.approved ? "Entry Agent: "+entry.reason : "STRONG M5 BUY/SELL: both agents approved"};
+  const momentum=momentumAgent(direction,m5,candles);
+  const risk=riskAgent(direction,m5,candles,levels,profile);
+  const votes=[trend,entry,momentum,risk].filter(agent=>agent.approved).length;
+  const balanced=profile==="BALANCED";
+  const approved=trend.approved && risk.approved &&
+    (balanced ? (entry.approved || momentum.approved) :
+      (entry.approved && momentum.approved));
+  const qualityScore=Math.min(99,Math.round(0.4*(m5?.confidence || 0)+
+    0.35*(m15?.confidence || 0)+0.25*Math.min(100,50+trend.adx)));
+  const reason=!trend.approved?"Trend Agent: "+trend.reason :
+    !risk.approved?"Risk Agent: "+risk.reason :
+    !approved?"Entry/Momentum Agents: "+entry.reason+"; "+momentum.reason :
+    "M5 "+votes+"/4 agents approved (Trend + Risk mandatory)";
+  return {approved,qualityScore,votes,totalAgents:4,requiredVotes:balanced?3:4,
+    trend,entry,momentum,risk,reason};
 }
