@@ -76,9 +76,9 @@ function waitingMarketSnapshot(){
     const previous=scanCache?.assets?.[symbol]||{};
     const open=liveTrades.get(symbol)||null;
     assets[symbol]={...previous,symbol,name:symbolLabel(symbol),signal:"WAIT",confirmed:false,status:"WAIT",confidence:0,levels:{},
-      setupReason:"Paused outside 08:00–20:00 UK to save API credits",trade:open};
+      setupReason:"Paused outside 08:00–22:00 UK to save API credits",trade:open};
   }
-  return {ok:true,version:"8.24 M5 BALANCED FOUR-AGENTS",updatedAt:new Date().toISOString(),cacheSeconds:SCAN_CACHE_MS/1000,
+  return {ok:true,version:"8.25 M5 BALANCED FOUR-AGENTS",updatedAt:new Date().toISOString(),cacheSeconds:SCAN_CACHE_MS/1000,
     marketSession:"PAUSED",assets};
 }
 
@@ -110,7 +110,7 @@ function isSignalWindowOpen(date = new Date()) {
   // UK local time follows GMT/BST automatically.
   const parts = new Intl.DateTimeFormat("en-GB", { timeZone:"Europe/London", hour:"2-digit", minute:"2-digit", hourCycle:"h23" }).formatToParts(date);
   const hour = Number(parts.find(part => part.type === "hour")?.value ?? 0);
-  return hour >= 8 && hour < 20;
+  return hour >= 8 && hour < 22;
 }
 
 function isClosedM5Candle(datetime) {
@@ -502,7 +502,7 @@ async function analyseAsset(symbol) {
   }
   if (signal !== "WAIT" && !isSignalWindowOpen()) {
     signal = "WAIT";
-    setupReason = "Signal schedule is 08:00–20:00 UK time";
+    setupReason = "Signal schedule is 08:00–22:00 UK time";
   }
   if (liveTrades.has(symbol)) {
     signal = "WAIT";
@@ -543,7 +543,7 @@ async function performScan() {
     const symbol = i === 0 ? "XAUUSD" : "BTCUSD";
     assets[symbol] = settled[i].status === "fulfilled" ? settled[i].value : { symbol, name:symbolLabel(symbol), signal:"WAIT", confidence:0, status:"ERROR", error:settled[i].reason?.message || "Data unavailable", timeframes:{} };
   }
-  return { ok:true, version:"8.24 M5 BALANCED FOUR-AGENTS", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
+  return { ok:true, version:"8.25 M5 BALANCED FOUR-AGENTS", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS / 1000, assets };
 }
 
 async function getScan(force = false) {
@@ -553,7 +553,7 @@ async function getScan(force = false) {
   if (dailyLimitResetAt > Date.now()) {
     if (scanCache) return scanCache;
     const error = `Twelve Data daily credits exhausted. Retry after ${new Date(dailyLimitResetAt).toISOString()}.`;
-    return { ok:true, version:"8.24 M5 BALANCED FOUR-AGENTS", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
+    return { ok:true, version:"8.25 M5 BALANCED FOUR-AGENTS", updatedAt:new Date().toISOString(), cacheSeconds:SCAN_CACHE_MS/1000, assets:{
       XAUUSD:{symbol:"XAUUSD",name:"GOLD",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}},
       BTCUSD:{symbol:"BTCUSD",name:"BITCOIN",signal:"WAIT",confidence:0,status:"ERROR",error,timeframes:{}}
     }};
@@ -575,9 +575,9 @@ app.get("/health", (req,res) => {
   const dailyLimit = dailyLimitResetAt > Date.now();
   const fresh = lastSuccessfulScanAt > 0 && Date.now() - lastSuccessfulScanAt < SCAN_CACHE_MS * 2;
   const marketDataStatus = !TWELVE_DATA_API_KEY ? "NOT_CONFIGURED" : dailyLimit ? "DAILY_LIMIT" : fresh ? "CONNECTED" : scanCache ? "UNAVAILABLE" : "CHECKING";
-  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.24 M5 BALANCED FOUR-AGENTS", status:"UP", signalMode:SIGNAL_MODE, twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, activeSession:activeUkSession(), requestBudget:BIT_DAILY_REQUEST_LIMIT, requestsToday:usageRequests, sharedBudgetNote:"Shared Twelve Data account may have other consumers; request counts are approximate credits", oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
+  res.json({ ok:true, service:"BIT ADAMS SERVER", version:"8.25 M5 BALANCED FOUR-AGENTS", status:"UP", signalMode:SIGNAL_MODE, twelveDataConfigured:Boolean(TWELVE_DATA_API_KEY), marketDataStatus, marketDataError:lastProviderError || null, marketDataUpdatedAt:lastSuccessfulScanAt ? new Date(lastSuccessfulScanAt).toISOString() : null, activeSession:activeUkSession(), signalHoursUk:"08:00–22:00", requestBudget:BIT_DAILY_REQUEST_LIMIT, requestsToday:usageRequests, sharedBudgetNote:"Shared Twelve Data account may have other consumers; request counts are approximate credits", oneSignalConfigured:Boolean(ONESIGNAL_APP_ID && ONESIGNAL_API_KEY), telegramConfigured:Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID), time:new Date().toISOString() });
 });
-app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.24 M5 BALANCED FOUR-AGENTS", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
+app.get("/", (req,res) => res.json({ app:"BIT ADAMS", version:"8.25 M5 BALANCED FOUR-AGENTS", status:"ONLINE", endpoints:{ health:"/health", scan:"/api/scan", market:"/api/market", testTelegram:"/api/test-telegram", tradingview:"/tradingview-webhook" } }));
 app.get(["/api/scan","/api/market"], async (req,res) => { try { res.json(await getScan()); } catch(error) { res.status(503).json({ ok:false,error:error.message }); } });
 app.get("/api/history", (req,res) => {
   res.json({ ok:true, updatedAt:new Date().toISOString(), trades:getTradeHistory() });
@@ -624,7 +624,7 @@ async function tradingViewWebhook(req,res) {
 app.post(["/tradingview-webhook","/webhook"],tradingViewWebhook);
 app.use((req,res) => res.status(404).json({ok:false,error:"Route not found"}));
 app.listen(PORT,"0.0.0.0",async () => {
-  console.log(`BIT ADAMS 8.24 M5 BALANCED FOUR-AGENTS running on port ${PORT}`);
+  console.log(`BIT ADAMS 8.25 M5 BALANCED FOUR-AGENTS running on port ${PORT}`);
   await loadTradeHistory();
   await loadUsage();
   for (const trade of tradeHistory.values()) {
