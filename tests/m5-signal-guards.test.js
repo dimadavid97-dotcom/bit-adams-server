@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {calculateAdx, trendAgent, entryAgent, reviewSignal} from "../signal-guards.js";
+import {calculateAdx, trendAgent, entryAgent, momentumAgent, riskAgent, reviewSignal} from "../signal-guards.js";
 
 function series(direction=1,n=80,flat=false) {
   const arr=[];
@@ -113,4 +113,35 @@ test("balanced still requires reward risk and directional trend",()=>{
   levels.tp2=levels.entry+5.5;
   m15.momentum=-0.3;
   assert.equal(reviewSignal(side,m5,m15,candles,levels,"BALANCED").approved,false);
+});
+
+test("balanced four-agent quorum accepts controlled strong breakout",()=>{
+  const {candles,m5,m15,levels,side}=setup(1);
+  const review=reviewSignal(side,m5,m15,candles,levels,"BALANCED");
+  assert.equal(review.approved,true,JSON.stringify(review));
+  assert.equal(review.totalAgents,4);
+  assert.ok(review.votes>=3);
+  assert.equal(momentumAgent(side,m5,candles).approved,true);
+  assert.equal(riskAgent(side,m5,candles,levels,"BALANCED").approved,true);
+});
+
+test("four-agent quorum cannot override bad M15 direction or invalid levels",()=>{
+  const {candles,m5,m15,levels,side}=setup(-1);
+  m15.signal="BUY";
+  assert.equal(reviewSignal(side,m5,m15,candles,levels,"BALANCED").approved,false);
+  m15.signal="SELL";
+  levels.sl=levels.entry+1; // SL must be above entry on a sell, but too close to meet R:R?
+  levels.sl=levels.entry-1; // Clearly invalid: sell SL is below entry.
+  const result=reviewSignal(side,m5,m15,candles,levels,"BALANCED");
+  assert.equal(result.risk.approved,false);
+  assert.equal(result.approved,false);
+});
+
+test("four-agent setup rejects fake momentum and incomplete candles",()=>{
+  const {candles,m5,m15,levels,side}=setup(1);
+  m5.momentum=-0.2;
+  assert.equal(momentumAgent(side,m5,candles).approved,false);
+  assert.equal(reviewSignal(side,m5,m15,candles,levels,"BALANCED").trend.approved,true);
+  const incomplete=candles.slice(0,3);
+  assert.equal(momentumAgent(side,m5,incomplete).approved,false);
 });
