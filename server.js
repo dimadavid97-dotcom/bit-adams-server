@@ -459,12 +459,23 @@ async function analyseAsset(symbol) {
     Number(latest.close) < Number(latest.open) &&
     Number(latest.close) < Number(previous.close) &&
     Number(latest.close) <= m5.ema9;
-  if (signal === "BUY" && (m5.confidence < MIN_SIGNAL_SCORE || !buyCandle || !cleanCandle || !buyMomentum || !nearTrend || !buyPullback)) {
+  // Balanced mode also recognises controlled trend continuations after an M5
+  // close beyond the previous candle's extreme. Prevent chasing price by
+  // retaining a strict ATR limit and all M15, momentum and dual-agent guards.
+  const continuationBand = BALANCED_MODE && m5.atr > 0 &&
+    Math.abs(m5.price - m5.ema9) <= m5.atr * 1.10;
+  const buyContinuation = continuationBand &&
+    m5.ema9 > m5.ema21 && Number(latest.close) > Number(previous.high);
+  const sellContinuation = continuationBand &&
+    m5.ema9 < m5.ema21 && Number(latest.close) < Number(previous.low);
+  const buyStructure = (nearTrend && buyPullback) || buyContinuation;
+  const sellStructure = (nearTrend && sellPullback) || sellContinuation;
+  if (signal === "BUY" && (m5.confidence < MIN_SIGNAL_SCORE || !buyCandle || !cleanCandle || !buyMomentum || !buyStructure)) {
     signal = "WAIT";
-    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !buyCandle ? "Wait for a completed bullish M5 candle" : !cleanCandle ? "M5 candle is weak or oversized — wait" : !buyMomentum ? "BUY momentum/RSI is stretched — wait" : !nearTrend ? "BUY is too far from EMA9 — do not chase" : "Waiting for M5 pullback and bullish rejection near EMA9";
-  } else if (signal === "SELL" && (m5.confidence < MIN_SIGNAL_SCORE || !sellCandle || !cleanCandle || !sellMomentum || !nearTrend || !sellPullback)) {
+    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !buyCandle ? "Wait for a completed bullish M5 candle" : !cleanCandle ? "M5 candle is weak or oversized — wait" : !buyMomentum ? "BUY momentum/RSI is stretched — wait" : "Waiting for safe M5 BUY pullback or controlled continuation";
+  } else if (signal === "SELL" && (m5.confidence < MIN_SIGNAL_SCORE || !sellCandle || !cleanCandle || !sellMomentum || !sellStructure)) {
     signal = "WAIT";
-    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !sellCandle ? "Wait for a completed bearish M5 candle" : !cleanCandle ? "M5 candle is weak or oversized — wait" : !sellMomentum ? "SELL momentum/RSI is stretched — wait" : !nearTrend ? "SELL is too far from EMA9 — do not chase" : "Waiting for M5 pullback and bearish rejection near EMA9";
+    setupReason = m5.confidence < MIN_SIGNAL_SCORE ? `M5 score below minimum ${MIN_SIGNAL_SCORE}` : !sellCandle ? "Wait for a completed bearish M5 candle" : !cleanCandle ? "M5 candle is weak or oversized — wait" : !sellMomentum ? "SELL momentum/RSI is stretched — wait" : "Waiting for safe M5 SELL pullback or controlled continuation";
   } else if (signal === "WAIT") {
     setupReason = "Waiting for clear M5 trend and momentum";
   }
@@ -489,7 +500,10 @@ async function analyseAsset(symbol) {
     signal = "WAIT";
     setupReason = "Trade already open — monitoring TP/SL; no duplicate entry";
   }
-  const setupType = signal === "WAIT" ? "WAIT" : `M5 ${SIGNAL_MODE} DUAL-AGENT CONFIRMATION`;
+  const continuationSetup = (signal === "BUY" && buyContinuation && !(nearTrend && buyPullback)) ||
+    (signal === "SELL" && sellContinuation && !(nearTrend && sellPullback));
+  const setupType = signal === "WAIT" ? "WAIT" :
+    `M5 ${SIGNAL_MODE} ${continuationSetup ? "TREND CONTINUATION" : "PULLBACK"} DUAL-AGENT`;
   const result = {
     symbol, name:symbolLabel(symbol), price:m5.price, signal,
     confidence:signal === "WAIT" ? 0 : agentReview.qualityScore,
