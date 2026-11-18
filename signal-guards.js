@@ -179,3 +179,44 @@ export function reviewSignal(direction,m5,m15,candles,levels,profile="STRICT") {
   return {approved,qualityScore,votes,totalAgents:4,requiredVotes:balanced?3:4,
     trend,entry,momentum,risk,reason};
 }
+
+
+/**
+ * ADAMS COMMANDER: final deterministic supervisory gate. It reuses
+ * data already calculated by the four reviewers; no extra API calls.
+ * A quality score describes setup quality, NOT the probability of winning.
+ */
+export function chiefAgent(direction,m5,m15,candles,levels,review) {
+  const sign=direction==="BUY"?1:direction==="SELL"?-1:0;
+  const last=Array.isArray(candles)?candles.at(-1):null;
+  const entry=Number(levels?.entry),sl=Number(levels?.sl),tp2=Number(levels?.tp2);
+  const risk=sign*(entry-sl),reward=sign*(tp2-entry);
+  const conditions=[
+    [Boolean(sign && last && m5 && m15 && levels),"Missing completed M5 market data"],
+    [review?.approved===true,"Four-agent panel rejected setup"],
+    [review?.trend?.approved===true && review?.risk?.approved===true,
+      "Trend or Risk agent rejected setup"],
+    [review?.entry?.approved===true,
+      "Entry agent did not approve closed M5 candle"],
+    [Number(review?.votes)>=3,"Fewer than 3 reviewers approved"],
+    [Number.isFinite(Number(review?.qualityScore)) && Number(review.qualityScore)>=72,
+      "Setup score below Chief threshold 72"],
+    [m5?.signal===direction && m15?.signal===direction,
+      "M5/M15 direction mismatch"],
+    [Number.isFinite(risk) && Number.isFinite(reward) && risk>0 && reward/risk>=1.3,
+      "Invalid stop or TP2 reward/risk"],
+    [Boolean(last && Number.isFinite(Number(last.open)) &&
+      Number.isFinite(Number(last.close)) &&
+      sign*(Number(last.close)-Number(last.open))>0),
+      "Closed M5 candle did not confirm direction"]
+  ];
+  const failure=conditions.find(([passed])=>!passed);
+  return {
+    approved:!failure,
+    decision:failure?"HOLD":"GREEN_LIGHT",
+    reason:failure?failure[1]:"Chief green light: Trend + Entry + Risk confirmed",
+    votes:Number(review?.votes)||0,
+    qualityScore:Number.isFinite(Number(review?.qualityScore))?Number(review.qualityScore):null,
+    entryMandatory:true
+  };
+}
