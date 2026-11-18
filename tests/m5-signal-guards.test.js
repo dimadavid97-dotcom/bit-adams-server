@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {calculateAdx, trendAgent, entryAgent, momentumAgent, riskAgent, reviewSignal} from "../signal-guards.js";
+import {calculateAdx, trendAgent, entryAgent, momentumAgent, riskAgent, reviewSignal, chiefAgent} from "../signal-guards.js";
 
 function series(direction=1,n=80,flat=false) {
   const arr=[];
@@ -144,4 +144,34 @@ test("four-agent setup rejects fake momentum and incomplete candles",()=>{
   assert.equal(reviewSignal(side,m5,m15,candles,levels,"BALANCED").trend.approved,true);
   const incomplete=candles.slice(0,3);
   assert.equal(momentumAgent(side,m5,incomplete).approved,false);
+});
+
+test("Chief allows safe BUY and SELL with Entry, Trend and Risk approval",()=>{
+  for(const direction of [1,-1]) {
+    const {candles,m5,m15,levels,side}=setup(direction);
+    const four=reviewSignal(side,m5,m15,candles,levels,"BALANCED");
+    const chief=chiefAgent(side,m5,m15,candles,levels,four);
+    assert.equal(chief.approved,true,JSON.stringify(chief));
+    assert.equal(chief.decision,"GREEN_LIGHT");
+  }
+});
+
+test("Chief vetoes a balanced 3/4 setup without Entry approval",()=>{
+  const {candles,m5,m15,levels,side}=setup(1);
+  const review=reviewSignal(side,m5,m15,candles,levels,"BALANCED");
+  const balancedVotes={...review,approved:true,votes:3,entry:{approved:false},
+    momentum:{approved:true},trend:{approved:true},risk:{approved:true}};
+  const chief=chiefAgent(side,m5,m15,candles,levels,balancedVotes);
+  assert.equal(chief.approved,false);
+  assert.match(chief.reason,/Entry/);
+});
+
+test("Chief vetoes wrong-way stop loss or conflicting M15",()=>{
+  const {candles,m5,m15,levels,side}=setup(1);
+  const review=reviewSignal(side,m5,m15,candles,levels,"BALANCED");
+  levels.sl=levels.entry+1;
+  assert.equal(chiefAgent(side,m5,m15,candles,levels,review).approved,false);
+  levels.sl=levels.entry-3;
+  m15.signal="SELL";
+  assert.equal(chiefAgent(side,m5,m15,candles,levels,review).approved,false);
 });
