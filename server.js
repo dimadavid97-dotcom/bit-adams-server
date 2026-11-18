@@ -3,7 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { reviewSignal } from "./signal-guards.js";
+import { reviewSignal, chiefAgent } from "./signal-guards.js";
 
 dotenv.config();
 
@@ -146,6 +146,7 @@ function eventMessage(event, symbol, payload = {}) {
   if (Number.isFinite(Number(payload.qualityScore))) {
     lines.push(`SETUP QUALITY: ${Number(payload.qualityScore)}/99 (NOT win probability)`);
   }
+  if (payload.chiefReview?.approved === true && ["BUY","SELL"].includes(event)) lines.push("🟢 ADAMS COMMANDER: UNDĂ VERDE (final approval)");
   if (payload.agentReview?.approved === true && ["BUY","SELL"].includes(event)) {
     lines.push(`✅ M5: ${payload.agentReview.votes ?? 2}/${payload.agentReview.totalAgents ?? 2} AGENTS APPROVED (TREND + RISK REQUIRED)`);
     lines.push("⏰ Check the chart before entering. Demo first.");
@@ -392,7 +393,7 @@ async function updateTrade(symbol, analysis) {
     const cooldown = Date.now() - (lastSignalAt.get(symbol) || 0);
     const lossCooldown = Date.now() - (lastLossAt.get(symbol) || 0);
     if (cooldown >= SIGNAL_COOLDOWN_MS && lossCooldown >= LOSS_COOLDOWN_MS) {
-      trade = { symbol, direction:analysis.signal, timeframe:"M5", setupType:analysis.setupType, confidence:analysis.confidence, qualityScore:analysis.qualityScore, agentReview:analysis.agentReview, status:"OPEN", createdAt:new Date().toISOString(), openedOnCandle:analysis.m5?.datetime || null, ...analysis.levels };
+      trade = { symbol, direction:analysis.signal, timeframe:"M5", setupType:analysis.setupType, confidence:analysis.confidence, qualityScore:analysis.qualityScore, agentReview:analysis.agentReview, chiefReview:analysis.chiefReview, status:"OPEN", createdAt:new Date().toISOString(), openedOnCandle:analysis.m5?.datetime || null, ...analysis.levels };
       liveTrades.set(symbol, trade); saveTradeSnapshot(trade); lastSignalAt.set(symbol, Date.now());
       await notifyEvent(trade.direction, symbol, trade);
       // Do not test the just-closed signal candle against levels calculated from its close.
@@ -489,9 +490,13 @@ async function analyseAsset(symbol) {
   }
   const candidateLevels = signal === "WAIT" ? {} : levels(symbol,signal,m5.price,m5.atr);
   const agentReview = signal === "WAIT" ? null : reviewSignal(signal,m5,m15,m5Candles,candidateLevels,SIGNAL_MODE);
+  const chiefReview = agentReview ? chiefAgent(signal,m5,m15,m5Candles,candidateLevels,agentReview) : null;
   if (agentReview && !agentReview.approved) {
     signal = "WAIT";
     setupReason = agentReview.reason;
+  } else if (chiefReview && !chiefReview.approved) {
+    signal = "WAIT";
+    setupReason = "Chief Agent: " + chiefReview.reason;
   }
   if (signal !== "WAIT" && !liveTrades.has(symbol)) {
     const pauseReason = signalPauseReason(symbol);
@@ -515,7 +520,7 @@ async function analyseAsset(symbol) {
   const result = {
     symbol, name:symbolLabel(symbol), price:m5.price, signal,
     confidence:signal === "WAIT" ? 0 : agentReview.qualityScore,
-    qualityScore:agentReview?.qualityScore ?? null, agentReview,
+    qualityScore:agentReview?.qualityScore ?? null, agentReview, chiefReview,
     setupType, setupReason, status:signal === "WAIT" ? "WAIT" : "CONFIRMED",
     confirmed:signal !== "WAIT", m5, m15, timeframes:{ M5:m5, M15:m15 },
     chartCandles:m5Candles.slice(-60)
