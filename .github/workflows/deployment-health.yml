@@ -1,4 +1,4 @@
-name: Check BIT ADAMS 8.22 Render deployment
+name: Check BIT ADAMS 8.26 Render deployment
 on:
   push:
     branches: [main]
@@ -19,7 +19,7 @@ jobs:
           python3 - <<'PY'
           import json,time,urllib.request
           url='https://bit-adams-server.onrender.com/health'
-          expected='8.22 M5 DUAL-AGENT ALERTS'
+          expected='8.26 M5 BALANCED FOUR-AGENTS'
           last=None
           for attempt in range(12):
               try:
@@ -28,7 +28,7 @@ jobs:
                   version=data.get('version')
                   print('Health:',json.dumps({'status':data.get('status'),'version':version,'market':data.get('marketDataStatus'),'telegramConfigured':data.get('telegramConfigured')},ensure_ascii=False),flush=True)
                   if data.get('status')=='UP' and version==expected:
-                      print('Server deployment verified, version 8.22 is live')
+                      print('Server deployment verified, version 8.26 is live')
                       break
                   last='Version not current: '+str(version)
               except Exception as error:
