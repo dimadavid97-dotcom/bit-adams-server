@@ -536,8 +536,25 @@ async function analyseAsset(symbol) {
   return result;
 }
 
+function isGoldWeekendClosed(date = new Date()) {
+  // Spot XAU/USD does not trade in the Saturday/Sunday daytime weekend.
+  // Monday-Friday M5 scanning continues normally; BTCUSD stays 24/7.
+  const day = new Intl.DateTimeFormat("en-GB", {
+    timeZone:"Europe/London",weekday:"short"
+  }).format(date);
+  return day === "Sat" || day === "Sun";
+}
+
 async function performScan() {
-  const settled = await Promise.allSettled([analyseAsset("XAUUSD"),analyseAsset("BTCUSD")]);
+  const gold = isGoldWeekendClosed()
+    ? Promise.resolve({
+        symbol:"XAUUSD",name:"GOLD",price:null,signal:"WAIT",
+        confidence:0,confirmed:false,status:"MARKET_CLOSED",
+        setupType:"WAIT",setupReason:"Gold market closed for the weekend",
+        levels:{},timeframes:{},chartCandles:[],trade:liveTrades.get("XAUUSD")||null
+      })
+    : analyseAsset("XAUUSD");
+  const settled = await Promise.allSettled([gold,analyseAsset("BTCUSD")]);
   const assets = {};
   for (let i=0;i<settled.length;i++) {
     const symbol = i === 0 ? "XAUUSD" : "BTCUSD";
