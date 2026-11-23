@@ -1,14 +1,61 @@
-name: Keep BIT ADAMS server awake
+name: Keep BIT ADAMS and ADAMS OPTION awake during trading sessions
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # Include BST and GMT hours; the script applies Europe/London accurately.
+    - cron: "*/10 7-21 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  ping-server:
+  check-services:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 4
     steps:
-      - name: Ping Render health endpoint
-        run: curl --fail --silent --show-error --retry 2 --retry-delay 15 --retry-all-errors --max-time 90 https://bit-adams-server.onrender.com/health
+      - name: Check both Render servers during UK signal hours
+        env:
+          TZ: Europe/London
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures
+          import datetime
+          import json
+          import time
+          import urllib.request
+          from zoneinfo import ZoneInfo
+
+          now = datetime.datetime.now(ZoneInfo("Europe/London"))
+          print("UK time:", now.isoformat(), flush=True)
+          if not (8 <= now.hour < 22):
+              print("Outside 08:00-22:00 UK; skipping to preserve free Render instance hours.")
+              raise SystemExit(0)
+
+          services = {"BIT ADAMS": "https://bit-adams-server.onrender.com/health"}
+          if now.weekday() < 5:
+              services["ADAMS OPTION"] = "https://adams-option-server.onrender.com/health"
+
+          def check(service):
+              name, url = service
+              last_error = None
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent":"adams-service-health/1.0", "Cache-Control":"no-cache"})
+                      with urllib.request.urlopen(req, timeout=65) as response:
+                          data = json.load(response)
+                      if data.get("ok") is not True or str(data.get("status", "")).lower() not in ("online", "up"):
+                          raise ValueError("Server did not confirm ONLINE/UP")
+                      print(name, "ONLINE", "telegramConfigured:", data.get("telegramConfigured"),
+                            "lastM5CycleAt:", data.get("lastM5CycleAt", "-"), flush=True)
+                      return
+                  except Exception as error:
+                      last_error = str(error)
+                      print(name, "attempt", attempt + 1, "failed:", last_error, flush=True)
+                      if attempt < 2:
+                          time.sleep(12)
+              raise RuntimeError(name + " did not respond successfully: " + str(last_error))
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+              list(executor.map(check, services.items()))
+          PY
